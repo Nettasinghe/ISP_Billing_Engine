@@ -1,0 +1,3966 @@
+#pragma warning(disable:4786)
+
+#include <stdio.h>
+#include <iostream>
+#include <string.h>
+#include <stdlib.h>
+#include <oraca.h>
+#include <sqlcpr.h>
+
+#include <sqlda.h>
+#include <sqlca.h>
+
+EXEC SQL DECLARE ISP DATABASE;
+
+
+
+
+#ifndef ORA_PROC
+	#include "db.h"
+	#include "db_data_containers.h"
+	#include "functions.h"
+	#include "My_Debug.h"
+	extern bill_cycle	*gsm_bill_cycle;
+	extern package_map	*gsm_packages;
+	extern connection_services_multimap	*gsm_connection_services;
+	extern taxes		*gsm_taxes;
+	extern discounts	*gsm_discounts;
+	extern connections	*gsm_connections;
+	extern FILE *logfile;
+#endif
+
+
+
+#define		BUF_LEN		   50
+#define		SESSION_FETCH_SIZE		100
+#define		FETCH_SIZE		2
+
+EXEC SQL BEGIN DECLARE SECTION;
+char *login_isp;
+EXEC SQL END DECLARE SECTION;
+
+
+EXEC SQL INCLUDE sqlda;
+EXEC SQL INCLUDE sqlca;
+EXEC ORACLE OPTION (ORACA=YES);
+
+
+
+
+void sql_error(char *msg)
+{
+    cout << endl << msg << endl;
+    sqlca.sqlerrm.sqlerrmc[sqlca.sqlerrm.sqlerrml] = '\0';
+    oraca.orastxt.orastxtc[oraca.orastxt.orastxtl] = '\0';
+    oraca.orasfnm.orasfnmc[oraca.orasfnm.orasfnml] = '\0';
+    cout << sqlca.sqlerrm.sqlerrmc << endl;
+    cout << "in " << oraca.orastxt.orastxtc << endl;
+    cout << "on line " << oraca.oraslnr << " of " << oraca.orasfnm.orasfnmc
+         << endl << endl;
+
+  //-- Roll back any pending changes and disconnect from Oracle.
+
+    EXEC SQL ROLLBACK RELEASE;
+    exit(1);
+}
+
+
+void not_found_error(char *msg)
+{
+    cout << endl << msg << endl;
+   
+  //-- Roll back any pending changes and disconnect from Oracle.
+
+    EXEC SQL ROLLBACK RELEASE;
+    exit(1);
+}
+
+
+
+// Connect to ORACLE.
+
+void db_connect_isp(char *in_login)
+{
+	login_isp = in_login;  // a pointer assignment, in_login has the space acclocation
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+    //printf("\nConnecting to ORACLE as    : %s\n", login_isp);
+	printf("\nConnecting to ORACLE "); 
+
+    EXEC SQL CONNECT :login_isp AT ISP;
+
+	printf("\nConnected to ORACLE ");
+	EXEC SQL AT ISP ALTER SESSION SET NLS_DATE_FORMAT="YYYYMMDD HH24:MI:SS";	// added on 16-09-2002
+	printf("\nChanged NLS_DATE_FORMAT ");
+}
+
+
+//-- exit with grace
+void db_disconnect_isp()
+{
+	debug("\nDisconnect from ORACLE as  : ");
+	debug(login_isp);
+	//printf("\nDisconnect from ORACLE as  : %s\n", login_isp);
+	printf("\nDisconnect from ORACLE ");
+	EXEC SQL AT ISP COMMIT WORK RELEASE;
+	printf("\nBill run successful ");
+	fprintf(logfile, "%s",  "\nDisconnect from ORACLE ");
+	fprintf(logfile, "%s",  "\nBill run successful\n ");
+ 
+    //exit(EXIT_SUCCESS); 	
+}
+
+//-- bill_adjustment_types
+void connections::db_read_bill_adjustment_types()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct bill_adjustment_types_t
+	{
+			char	adjustment_type[15];		// varchar2(10)			
+			char	date_created[BUF_LEN];		// varchar2(1)	
+			char	tax[2];					
+	} *a;
+
+	struct bill_adjustment_types_ind
+	{ 
+  			short	adjustment_type_ind;				
+			short	date_created_ind;		
+			short	tax_ind;					
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	
+	bill_adjustment_type	bat;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new bill_adjustment_types_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for bill_adjustment_types fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_bill_adjustment_types CURSOR FOR
+	SELECT	ADJUSTMENT_TYPE,				
+			DATE_CREATED,
+			TAX		
+	FROM	BILL_ADJUSTMENT_TYPES;
+	
+       
+    EXEC SQL AT ISP  OPEN c_bill_adjustment_types; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_bill_adjustment_types INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			strcpy(a[i].adjustment_type,
+				  ((a_ind[i].adjustment_type_ind < 0) ? "UNDEF":a[i].adjustment_type));
+			strcpy(a[i].date_created,
+				  ((a_ind[i].date_created_ind < 0) ? "UNDEF":a[i].date_created));
+			strcpy(a[i].tax,
+				  ((a_ind[i].tax_ind < 0) ? "U":a[i].tax));
+			
+						
+			bat.adjustment_type	= a[i].adjustment_type;
+
+			if ( strcmp(a[i].tax,"Y")==0)
+			{
+				bat.tax			= true;
+			}
+			else
+			{
+				if ( strcmp(a[i].tax,"N")==0)
+				{
+					bat.tax			= false;
+				}
+				else
+				{
+					cout << "Undefined tax value in BILL_ADJUSTMENT_TYPES" << endl;
+					cout << a[i].tax << "end" << endl;
+				}
+			}
+				 
+			bat.value			= 0;						
+				
+			gsm_connections->bill_adjustment_type_map[a[i].adjustment_type] = bat;
+
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_bill_adjustment_types; 
+	delete a;
+	printf("%d  c_bill_adjustment_types records read.\n\n",rows_before);
+} 
+
+//-- checking bill_master_raw_for_entries
+void connections::check_bill_master_raw()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	int row_count=0;
+	EXEC SQL END DECLARE SECTION;
+	
+    EXEC SQL 
+	AT ISP 
+	SELECT COUNT(*) INTO :row_count FROM BILL_MASTER_RAW ;
+	
+	if (row_count >0 )
+	{
+		cout << "Entries already in bill_master_raw table" << endl;
+		fprintf(logfile, "%s",  "\nEntries already in bill_master_raw table ");
+		fprintf(logfile, "%s",  "\nExiting with Error ");
+		cout <<"Exiting with Error" << endl;				
+	}		
+}
+
+//-- checking bill_summary_items_raw_for_entries
+void connections::check_bill_summary_items_raw()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	int row_count=0;
+	EXEC SQL END DECLARE SECTION;
+	
+    EXEC SQL 
+	AT ISP 
+	SELECT COUNT(*) INTO :row_count FROM BILL_SUMMARY_ITEMS_RAW ;
+	
+	if (row_count >0 )
+	{
+		cout << "Entries already in bill_summary_items_raw table" << endl;
+		fprintf(logfile, "%s",  "\nEntries already in bill_summary_items_raw table ");
+		fprintf(logfile, "%s",  "\nExiting with Error ");
+		cout <<"Exiting with Error" << endl;				
+	}		
+	
+}
+
+//-- sessions
+void connections::db_read_sessions()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct session_t
+	{
+		char	session_id[BUF_LEN];				
+		char	user_id[BUF_LEN];		
+		char	ip_login[BUF_LEN];					
+		int		time_duration;				
+		char	start_time[BUF_LEN];		
+		char	end_time[BUF_LEN];				
+		int		bytes_in;	
+		int		bytes_out;		
+		int		input_pkts;		
+		int		output_pkts;		
+		char	service_type[BUF_LEN];
+		float	charge;
+		int		account_no;
+		float	free_min;
+		int		no_of_units;
+	} *a;
+
+	struct session_ind
+	{
+		short	session_id_ind;				
+		short	user_id_ind;		
+		short	ip_login_ind;					
+		short	time_duration_ind;				
+		short	start_time_ind;		
+		short	end_time_ind;				
+		short	bytes_in_ind;	
+		short	bytes_out_ind;		
+		short	input_pkts_ind;		
+		short	output_pkts_ind;		
+		short	service_type_ind;
+		short	charge_ind;
+		short	account_no_ind;
+		short	free_min_ind;
+		short	no_of_units_ind;
+	}a_ind[SESSION_FETCH_SIZE];
+
+	char t_start_date[20], t_end_date[20];
+	char t_session_date[20];
+	int t_start_ac, t_end_ac;
+	int rows_to_fetch, rows_before, rows_this_time;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+	strcpy(t_session_date, session_date.c_str());
+	t_start_ac = start_ac_no;
+	t_end_ac = end_ac_no;
+	session_data sd;
+
+	rows_to_fetch = SESSION_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = SESSION_FETCH_SIZE; 
+
+	if((a = new session_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for session fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_session CURSOR FOR 
+	SELECT	SESSION_ID,				
+			USER_ID,		
+			IP_LOGIN,					
+			TIME_DURATION,				
+			START_TIME,		
+			END_TIME,				
+			BYTES_IN,	
+			BYTES_OUT,		
+			INPUT_PKTS,		
+			OUTPUT_PKTS,		
+			SERVICE_TYPE,
+			CHARGE,
+			ACCOUNT_NO,
+			FREE_MINUTES,
+			NO_OF_UNITS
+	FROM	RATED_SESSION_RECORDS
+	WHERE	TRUNC(START_TIME) >= to_date(:t_start_date,'YYYYMMDD') AND TRUNC(START_TIME) <= to_date(:t_end_date,'YYYYMMDD')
+			ORDER BY START_TIME;
+			
+    EXEC SQL AT ISP  OPEN c_session; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_session INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].session_id,
+				  ((a_ind[i].session_id_ind < 0) ? "UNDEF":a[i].session_id));
+			strcpy(a[i].user_id,
+				  ((a_ind[i].user_id_ind < 0) ? "UNDEF":a[i].user_id));
+			strcpy(a[i].ip_login,
+				  ((a_ind[i].ip_login_ind < 0) ? "UNDEF":a[i].ip_login));
+			strcpy(a[i].start_time,
+				  ((a_ind[i].start_time_ind < 0) ? "UNDEF":a[i].start_time));
+			strcpy(a[i].end_time,
+				  ((a_ind[i].end_time_ind < 0) ? "UNDEF":a[i].end_time));
+			strcpy(a[i].service_type,
+				  ((a_ind[i].service_type_ind < 0) ? "UNDEF":a[i].service_type));
+			a[i].time_duration = (a_ind[i].time_duration_ind < 0) ? 0.0 : a[i].time_duration;
+			a[i].bytes_in = (a_ind[i].bytes_in_ind < 0) ? 0.0 : a[i].bytes_in;
+			a[i].bytes_out = (a_ind[i].bytes_out_ind < 0) ? 0.0 : a[i].bytes_out;
+			a[i].input_pkts = (a_ind[i].input_pkts_ind < 0) ? 0.0 : a[i].input_pkts;
+			a[i].output_pkts = (a_ind[i].output_pkts_ind < 0) ? 0.0 : a[i].output_pkts ;
+			a[i].charge = (a_ind[i].charge_ind < 0) ? 0.0 : a[i].charge ;
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no;
+			a[i].free_min = (a_ind[i].free_min_ind < 0) ? 0.0 : a[i].free_min ;
+			a[i].no_of_units = (a_ind[i].no_of_units_ind < 0) ? 0 : a[i].no_of_units;
+			
+
+			sd.session_id		= a[i].session_id;
+			sd.user_id			= a[i].user_id;					
+			sd.ip_login			= a[i].ip_login;	
+			sd.time_duration	= a[i].time_duration;						
+			sd.start_time		= a[i].start_time;						
+			sd.end_time			= a[i].end_time;	
+			sd.bytes_in			= a[i].bytes_in;					
+			sd.bytes_out		= a[i].bytes_out;		
+			sd.input_pkts		= a[i].input_pkts;		
+			sd.output_pkts		= a[i].output_pkts; 
+			sd.service_type		= a[i].service_type;
+			sd.charge			= a[i].charge;
+			sd.account_no		= a[i].account_no;
+			sd.free_min			= a[i].free_min;
+			sd.no_of_units		= a[i].no_of_units;	
+		
+			if(set_current(sd.account_no))
+				current->call.summarize_sessions(&sd);
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_session; 
+	delete a;
+	printf("%d  sessions records read.\n\n",rows_before);
+}
+
+//-- gric sessions
+void connections::db_read_gric_sessions()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct gric_session_t
+	{
+		char	client_code[BUF_LEN];
+		int		account_no;
+		char	service_type[BUF_LEN];
+		char	record_type[BUF_LEN];
+		char	gmt_start_date[BUF_LEN];		
+		char	gmt_start_time[BUF_LEN];		
+		char	local_start_date[BUF_LEN];		
+		char	local_start_time[BUF_LEN];		
+		char	user_id[BUF_LEN];		
+		char	service_provider[BUF_LEN];		
+		char	time_unit[BUF_LEN];
+		double	time_duration;				
+		char	region_name[BUF_LEN];
+		double	charge;
+		float	no_of_units;
+		char	rated_date[BUF_LEN];		
+		int		file_id;
+		char	session_id[BUF_LEN];				
+		char	nas_ip_login[BUF_LEN];					
+		char	local_country[BUF_LEN];					
+	} *a;
+
+	struct gric_session_ind
+	{
+		short	client_code_ind;
+		short	account_no_ind;
+		short	service_type_ind;
+		short	record_type_ind;
+		short	gmt_start_date_ind;		
+		short	gmt_start_time_ind;		
+		short	local_start_date_ind;		
+		short	local_start_time_ind;		
+		short	user_id_ind;		
+		short	service_provider_ind;		
+		short	time_unit_ind;
+		short	time_duration_ind;				
+		short	region_name_ind;
+		short	charge_ind;
+		short	no_of_units_ind;
+		short	rated_date_ind;		
+		short	file_id_ind;
+		short	session_id_ind;				
+		short	nas_ip_login_ind;					
+		short	local_country_ind;					
+	}a_ind[SESSION_FETCH_SIZE];
+
+	char t_start_date[20], t_end_date[20];
+	char t_session_date[20];
+	int t_start_ac, t_end_ac;
+	int rows_to_fetch, rows_before, rows_this_time;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+	strcpy(t_session_date, session_date.c_str());
+	t_start_ac = start_ac_no;
+	t_end_ac = end_ac_no;
+	gric_session_data gsd;
+
+	rows_to_fetch = SESSION_FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = SESSION_FETCH_SIZE; 
+
+	if((a = new gric_session_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for GRIC session fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_gric_session CURSOR FOR 
+	SELECT	CLIENT_CODE,
+			ACCOUNT_NO, 
+			SERVICE_TYPE, 	   
+			RECORD_TYPE, 
+			GMT_DATE,		
+			GMT_TIME,		
+			LOCAL_DATE,		
+			LOCAL_TIME,		
+			USER_ID,		
+			SERVICE_PROVIDER,		
+			TIME_UNIT,
+			SESSION_TIME,				
+			REGION_NAME,
+			CHARGE,
+			NO_OF_UNITS,
+			RATED_DATE,		
+			FILE_ID,
+			SESSION_ID,				
+			NAS_IP_LOGIN,					
+			LOCAL_COUNTRY
+	FROM	GRIC_RATED_SESSIONS
+	WHERE	TRUNC(RATED_DATE) BETWEEN TO_DATE(:t_start_date,'YYYYMMDD') AND TO_DATE(:t_end_date,'YYYYMMDD');
+			
+    EXEC SQL AT ISP  OPEN c_gric_session; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_gric_session INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//start - handling null fetches
+
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0 : a[i].account_no;
+			strcpy(a[i].service_type,
+				  ((a_ind[i].service_type_ind < 0) ? "UNDEF":a[i].service_type));
+			strcpy(a[i].record_type,
+				  ((a_ind[i].record_type_ind < 0) ? "UNDEF":a[i].record_type));
+			strcpy(a[i].gmt_start_date,
+				  ((a_ind[i].gmt_start_date_ind < 0) ? "UNDEF":a[i].gmt_start_date));
+			strcpy(a[i].gmt_start_time,
+				  ((a_ind[i].gmt_start_time_ind < 0) ? "UNDEF":a[i].gmt_start_time));
+			strcpy(a[i].local_start_date,
+				  ((a_ind[i].local_start_date_ind < 0) ? "UNDEF":a[i].local_start_date));
+			strcpy(a[i].local_start_time,
+				  ((a_ind[i].local_start_time_ind < 0) ? "UNDEF":a[i].local_start_time));
+			strcpy(a[i].user_id,
+				  ((a_ind[i].user_id_ind < 0) ? "UNDEF":a[i].user_id));
+			strcpy(a[i].service_provider,
+				  ((a_ind[i].service_provider_ind < 0) ? "UNDEF":a[i].service_provider));
+			strcpy(a[i].time_unit,
+				  ((a_ind[i].time_unit_ind < 0) ? "UNDEF":a[i].time_unit));
+			a[i].time_duration = (a_ind[i].time_duration_ind < 0) ? 0 : a[i].time_duration;
+			strcpy(a[i].time_unit,
+				  ((a_ind[i].time_unit_ind < 0) ? "UNDEF":a[i].time_unit));
+			strcpy(a[i].region_name,
+				  ((a_ind[i].region_name_ind < 0) ? "UNDEF":a[i].region_name));
+			a[i].charge = (a_ind[i].charge_ind < 0) ? 0.0 : a[i].charge ;
+			a[i].no_of_units = (a_ind[i].no_of_units_ind < 0) ? 0 : a[i].no_of_units;
+			a[i].file_id = (a_ind[i].file_id_ind < 0) ? 0 : a[i].file_id;
+			strcpy(a[i].session_id,
+				  ((a_ind[i].session_id_ind < 0) ? "UNDEF":a[i].session_id));
+			strcpy(a[i].nas_ip_login,
+				  ((a_ind[i].nas_ip_login_ind < 0) ? "UNDEF":a[i].nas_ip_login));
+			strcpy(a[i].local_country,
+				  ((a_ind[i].local_country_ind < 0) ? "UNDEF":a[i].local_country));
+			// stop - handling null fetches
+
+
+			gsd.client_code			=	a[i].client_code;
+			gsd.account_no			=	a[i].account_no;
+			gsd.service_type		=	a[i].service_type;
+			gsd.record_type			=	a[i].record_type;
+			gsd.gmt_start_date		=	a[i].gmt_start_date;
+			gsd.gmt_start_time		=	a[i].gmt_start_time;
+			gsd.local_start_date	=	a[i].local_start_date;
+			gsd.local_start_time	=	a[i].local_start_time;
+			gsd.user_id				=	a[i].user_id;
+			gsd.service_provider	=	a[i].service_provider;
+			gsd.time_unit			=	a[i].time_unit;
+			gsd.time_duration		=	a[i].time_duration;
+			gsd.region_name			=	a[i].region_name;
+			gsd.charge				=	a[i].charge;
+			gsd.no_of_units			=	a[i].no_of_units;
+			gsd.rated_date			=	a[i].rated_date;
+			gsd.file_id				=	a[i].file_id;
+			gsd.session_id			=	a[i].session_id;
+			gsd.nas_ip_login		=	a[i].nas_ip_login;
+			gsd.local_country		=	a[i].local_country;
+
+			if( set_current(gsd.account_no) )
+			{
+				current->call.summarize_gric_sessions(&gsd);
+			}
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_gric_session; 
+	delete a;
+	printf("%d  GRIC sessions records read.\n\n",rows_before);
+}
+
+//-- connections
+void connections::db_read_connections()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection_t
+	{
+		int		account_no;
+		char	package_code[6];		// 6 instead of BUF_LEN // varchar2(5)
+		char	current_status_date[BUF_LEN];
+		char	tax_group_id[10];
+		char	corporate_code[10];
+		char	client_code[10];		// varchar2(8)
+		char	vat_no[BUF_LEN];		//	varchar2(20)
+		char	connection_status[BUF_LEN];
+	} *a;
+
+	struct connection_ind
+	{ 
+  		short	account_no_ind;
+		short	package_code_ind;
+		short	current_status_date_ind;
+		short	tax_group_id_ind;
+		short	corporate_code_ind;
+		short	client_code_ind;
+		short	vat_no_ind;
+		short	connection_status_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char ub_start_date[15];
+	char ub_end_date[15];
+
+EXEC SQL END DECLARE SECTION;
+
+EXEC ORACLE OPTION (char_map=string) ;
+
+	int i;
+	strcpy(ub_start_date, start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	debug("ub_end_date :");
+	debug(ub_end_date);
+	cout << endl;
+	connection_detail cd;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new connection_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connection fetch"<<endl;
+		exit(0);
+	}
+	    
+	EXEC SQL 
+	AT ISP 
+	DECLARE  c_connection CURSOR FOR 
+	SELECT	ACCOUNT_NO,				
+			PACKAGE_CODE,		
+			CURRENT_STATUS_DATE,					
+			TAX_GROUP_ID,				
+			CORPORATE_CODE,
+			CLIENT_CODE,
+			VAT_NO,
+			CONNECTION_STATUS
+	FROM	MIRRORED_BILL_CONNECTIONS
+	WHERE	TRUNC(COMMENCEMENT_DATE) <= to_date(:ub_end_date,'YYYYMMDD')
+	AND 
+	(	
+		CONNECTION_STATUS ='CONNT' OR CONNECTION_STATUS ='TDISC' OR 
+		(
+			(
+				TRUNC(CURRENT_STATUS_DATE) BETWEEN 
+				to_date(:ub_start_date,'YYYYMMDD') 
+				AND 
+				to_date(:ub_end_date,'YYYYMMDD')
+			)
+			AND
+			( CONNECTION_STATUS ='PDISC' )
+		)
+	)
+	AND	TRUNC(BILL_PERIOD_START) = to_date(:ub_start_date,'YYYYMMDD'); 
+           
+    EXEC SQL AT ISP  OPEN c_connection; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_connection INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0 : a[i].account_no ;
+			strcpy(a[i].package_code,
+				  ((a_ind[i].package_code_ind < 0) ? "UNDEF":a[i].package_code));
+			strcpy(a[i].corporate_code,
+				  ((a_ind[i].corporate_code_ind < 0) ? "UNDEF":a[i].corporate_code));
+			strcpy(a[i].current_status_date,
+				  ((a_ind[i].current_status_date_ind < 0) ? "20501225":a[i].current_status_date)); // 20501225 a far away date put for null entries
+			strcpy(a[i].tax_group_id,
+				  ((a_ind[i].tax_group_id_ind < 0) ? "UNDEF":a[i].tax_group_id));
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].vat_no,
+				  ((a_ind[i].vat_no_ind < 0) ? "UNDEF":a[i].vat_no));
+			strcpy(a[i].connection_status,
+				  ((a_ind[i].connection_status_ind < 0) ? "UNDEF":a[i].connection_status));
+
+
+			int posi = strcspn( a[i].client_code, " " );
+			a[i].client_code[posi] = '\0';
+
+			//assining values fetched from db to the connection_detail class
+			cd.account_no		= a[i].account_no;					
+			cd.package_code		= a[i].package_code;
+
+			// cahnged on 16-09-2002
+			a[i].current_status_date[8] = '\0';
+			cd.current_status_date.set_date(a[i].current_status_date);	
+			//cd.disconnected_date= a[i].disconnected_date;	
+			// end - 16-09-2002
+								
+			cd.tax_group_id			= a[i].tax_group_id;						
+			cd.corporate_code		= a[i].corporate_code;
+			cd.client_code			= a[i].client_code;	
+			cd.vat_no				= a[i].vat_no;	
+			cd.connection_status	= a[i].connection_status;	
+			
+
+			CLIENTS_DEF::iterator i_current = gsm_connections->clients_map.find(a[i].client_code);
+			
+			if(i_current != gsm_connections->clients_map.end())
+			{
+				//cout <<"Client code matches >>>>>>>>>>>>>>>" << endl;
+
+				if ( strcmp(gsm_bill_cycle->bill_cycle_code.c_str(), (*i_current).second.c_str())==0 )
+				{
+					//cout <<"Bill run code matches >>>>>>>>>>>>>>>" << endl;
+					insert(a[i].account_no, cd);
+					//print_detail();
+				}
+				else
+				{
+					//cout <<"Bill run code do not match >>>>>>>>>>>>>>>" << endl;
+				}
+			}
+			else
+			{
+				//cout <<"Client code does not match >>>>>>>>>>>>>>>" << endl;
+			}
+			
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_connection; 
+	delete a;
+	printf("%d  connection records read.\n\n",rows_before);
+} 
+
+
+//-- clients
+void connections::db_read_clients()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct client_t
+	{
+		char	br_code[10];			// varchar2(5)
+		char	client_code[10];		// varchar2(8)
+	} *a;
+
+	struct client_ind
+	{ 
+  		short	br_code_ind;
+		short	client_code_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char	t_start_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date, start_date.c_str());
+	
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new client_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for client fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_client CURSOR FOR
+	SELECT	BR_CODE,
+			CLIENT_CODE		
+	FROM	MIRRORED_BILL_CLIENTS
+	WHERE	TRUNC(BILL_PERIOD_START) = to_date(:t_start_date,'YYYYMMDD'); 
+	
+       
+    EXEC SQL AT ISP  OPEN c_client; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_client INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].br_code,
+				  ((a_ind[i].br_code_ind < 0) ? "UNDEF":a[i].br_code));
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+
+			int posi = strcspn( a[i].client_code, " " );
+			a[i].client_code[posi] = '\0';
+
+			int position = strcspn( a[i].br_code, " " );
+			a[i].br_code[position] = '\0';
+
+			
+
+			clients_map[a[i].client_code] = a[i].br_code;
+			
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_client; 
+	delete a;
+	printf("%d  clients records read.\n\n",rows_before);
+} 
+
+//-- bill_master
+void connections::db_read_bill_master()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct bill_master_t
+	{
+			char	client_code[BUF_LEN];				
+			int		account_no;		
+			char	bill_no[BUF_LEN];					
+			char	due_date[BUF_LEN];				
+			char	bill_date[BUF_LEN];		
+			char	bill_period_start[BUF_LEN];				
+			char	bill_period_end[BUF_LEN];	
+			float	balance_bf;		
+			float	bill_amount;		
+			float	balance_cf;		
+			char	bill_run_code[BUF_LEN];
+			float	bill_payments;
+			int		run_no;
+			char	printed[BUF_LEN];
+	} *a;
+
+	struct bill_master_ind
+	{ 
+  		short	client_code_ind;
+		short	account_no_ind;
+		short	bill_no_ind;
+		short	due_date_ind;
+		short	bill_date_ind;
+		short	bill_period_start_ind;
+		short	bill_period_end_ind;
+		short	balance_bf_ind;
+		short	bill_amount_ind;
+		short	balance_cf_ind;
+		short	bill_run_code_ind;
+		short	bill_payments_ind;
+		short	run_no_ind;
+		short	printed_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+	char  ub_start_date[10];		// date 			not null
+	char  ub_end_date[10];			// date				not null
+	
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(ub_start_date, start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	bill_master bm;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new bill_master_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for bill_master fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_bill_master CURSOR FOR 
+	SELECT	CLIENT_CODE,				
+			ACCOUNT_NO,		
+			BILL_NO,					
+			DUE_DATE,				
+			BILL_DATE,		
+			BILL_PERIOD_START,				
+			BILL_PERIOD_END,	
+			BALANCE_BF,		
+			BILL_AMOUNT,		
+			BALANCE_CF,		
+			BILL_RUN_CODE,
+			BILL_PAYMENTS,
+			RUN_NO,
+			PRINTED
+	FROM	BILL_MASTER
+	WHERE		BILL_PERIOD_START = to_date(:ub_start_date,'YYYYMMDD') 
+	AND		BILL_PERIOD_END = to_date(:ub_end_date,'YYYYMMDD') ;
+	
+       
+    EXEC SQL AT ISP  OPEN c_bill_master; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_bill_master INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no ;
+			strcpy(a[i].bill_no,
+				  ((a_ind[i].bill_no_ind < 0) ? "UNDEF":a[i].bill_no));
+			strcpy(a[i].due_date,
+				  ((a_ind[i].due_date_ind < 0) ? "UNDEF":a[i].due_date));
+			strcpy(a[i].bill_date,
+				  ((a_ind[i].bill_date_ind < 0) ? "UNDEF":a[i].bill_date));
+			strcpy(a[i].bill_period_start,
+				  ((a_ind[i].bill_period_start_ind < 0) ? "UNDEF":a[i].bill_period_start));
+			strcpy(a[i].bill_period_end,
+				  ((a_ind[i].bill_period_end_ind < 0) ? "UNDEF":a[i].bill_period_end));
+			a[i].balance_bf = (a_ind[i].balance_bf_ind < 0) ? 0.0 : a[i].balance_bf;
+			a[i].bill_amount = (a_ind[i].bill_amount_ind < 0) ? 0.0 : a[i].bill_amount;
+			a[i].balance_cf = (a_ind[i].balance_cf_ind < 0) ? 0.0 : a[i].balance_cf ;
+			strcpy(a[i].bill_run_code,
+				  ((a_ind[i].bill_run_code_ind < 0) ? "UNDEF":a[i].bill_run_code));
+			a[i].bill_payments = (a_ind[i].bill_payments_ind < 0) ? 0.0 : a[i].bill_payments;
+			a[i].run_no = (a_ind[i].run_no_ind < 0) ? 0.0 : a[i].run_no;
+			strcpy(a[i].printed,
+				  ((a_ind[i].printed_ind < 0) ? "UNDEF":a[i].printed));
+			
+
+			
+			if(set_current(a[i].account_no))
+			{
+				current->charge.payments += a[i].bill_payments; // payments during period
+				current->charge.brought_forward = a[i].balance_bf;	
+				current->connection.invoice_no = a[i].bill_no;
+				current->charge.open_bill_found = 1;
+			}
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_bill_master; 
+	delete a;
+	printf("%d  bill_master records read.\n\n",rows_before);
+} 
+
+  
+//-- connection_services
+void connection_services_multimap::db_read_connection_services()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection_services_t
+	{
+			float	rental;				
+			char	start_date[BUF_LEN];		
+			char	end_date[BUF_LEN];					
+			int		account_no;				
+			char	client_code[BUF_LEN];		
+			char	service_code[BUF_LEN];				
+			char	user_username[BUF_LEN];		
+			int		service_instance;		
+			char	connection_status[BUF_LEN];		
+			char	attribution[BUF_LEN];
+			char	rate_group_id[BUF_LEN];
+			char	rental_actv_date[BUF_LEN];
+			float	service_quota;
+	} *a;
+
+	struct connection_services_ind
+	{ 
+  		short	rental_ind;
+		short	start_date_ind;
+		short	end_date_ind;
+		short	account_no_ind;
+		short	client_code_ind;
+		short	service_code_ind;
+		short	user_username_ind;
+		short	service_instance_ind;
+		short	connection_status_ind;
+		short	attribution_ind;
+		short	rate_group_id_ind;
+		short	rental_actv_date_ind;
+		short	service_quota_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char t_start_date[20];
+	char t_end_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	connection_services cs;
+
+	strcpy(t_start_date,gsm_connections->start_date.c_str());
+	strcpy(t_end_date, gsm_connections->end_date.c_str());
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new connection_services_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connection_services fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_connection_services CURSOR FOR 
+	SELECT	RENTAL,				
+			START_DATE,		
+			END_DATE,					
+			ACCOUNT_NO,				
+			CLIENT_CODE,		
+			SERVICE_CODE,				
+			USER_USERNAME,		
+			SERVICE_INSTANCE,		
+			CONNECTION_STATUS,		
+			ATTRIBUTION,
+			RATE_GROUP_ID,
+			RENTAL_ACTV_DATE,
+			SERVICE_QUOTA
+	FROM	MIRRORED_BILL_CONN_SERVICES
+	WHERE	TRUNC(RENTAL_ACTV_DATE) <= to_date(:t_end_date,'YYYYMMDD')	
+	AND	TRUNC(BILL_PERIOD_START) = to_date(:t_start_date,'YYYYMMDD'); 	// 15th Jan 2002
+	
+	
+       
+    EXEC SQL AT ISP  OPEN c_connection_services; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_connection_services INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			a[i].rental = (a_ind[i].rental_ind < 0) ? 0.0 : a[i].rental ;
+			strcpy(a[i].start_date,
+				  ((a_ind[i].start_date_ind < 0) ? "UNDEF":a[i].start_date));
+
+/*			strcpy(a[i].end_date,
+				  ((a_ind[i].end_date_ind < 0) ? "UNDEF":a[i].end_date));
+*/
+//Arjuna
+			strcpy(a[i].end_date,
+				  ((a_ind[i].end_date_ind < 0) ? "20501225":a[i].end_date));
+//Arjuna
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no ;
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].service_code,
+				  ((a_ind[i].service_code_ind < 0) ? "UNDEF":a[i].service_code));
+			strcpy(a[i].user_username,
+				  ((a_ind[i].user_username_ind < 0) ? "UNDEF":a[i].user_username));
+			a[i].service_instance = (a_ind[i].service_instance_ind < 0) ? 0.0 : a[i].service_instance ;
+			strcpy(a[i].connection_status,
+				  ((a_ind[i].connection_status_ind < 0) ? "UNDEF":a[i].connection_status));
+			strcpy(a[i].attribution,
+				  ((a_ind[i].attribution_ind < 0) ? "UNDEF":a[i].attribution));
+			strcpy(a[i].rate_group_id,
+				  ((a_ind[i].rate_group_id_ind < 0) ? "UNDEF":a[i].rate_group_id));
+			strcpy(a[i].rental_actv_date,
+				  ((a_ind[i].rental_actv_date_ind < 0) ? "UNDEF":a[i].rental_actv_date));
+			a[i].service_quota = (a_ind[i].service_quota_ind < 0) ? 0.0 : a[i].service_quota ;
+
+			
+			//assining values fetched from db to the connection_detail class
+			cs.rental			= a[i].rental;				
+			cs.start_date		= a[i].start_date;		
+			cs.end_date			= a[i].end_date;					
+			cs.account_no		= a[i].account_no;				
+			cs.client_code		= a[i].client_code;		
+			cs.service_code		= a[i].service_code;				
+			cs.user_username	= a[i].user_username;		
+			cs.service_instance	= a[i].service_instance;		
+			cs.connection_status= a[i].connection_status;		
+			cs.attribution		= a[i].attribution;
+			cs.rate_group_id	= a[i].rate_group_id;
+			cs.rental_actv_date	= a[i].rental_actv_date;
+			cs.service_quota	= a[i].service_quota;
+
+			/* Added by Arjuna Aryasinha 2003-NOV-10 */
+			a[i].end_date[8] = '\0';
+			cs.reng_end_date.set_date(a[i].end_date); 
+			/* End of addition by Arjuna Aryasinha 2003-NOV-10 */
+
+			gsm_connection_services->insert(cs.account_no, cs);
+
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_connection_services; 
+	delete a;
+	printf("%d  connection_services records read.\n\n",rows_before);
+} 
+
+//-- packages
+void package_map::db_read_packages()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct packages_t
+	{
+			char	package_code[6];		// 6 instead of BUF_LEN				
+			char	description[BUF_LEN];		
+			float	rental;					
+			char	free_applied_on[BUF_LEN];				
+			int		free_in_bytes;		
+			int		free_out_bytes;				
+			int		free_minutes;	
+			char	activated_on[BUF_LEN];		
+			char	deactivated_on[BUF_LEN];
+			char	package_type[BUF_LEN];
+			int		free_units;				// number(10)		
+	} *a;
+
+	struct packages_ind
+	{ 
+  		short	package_code_ind;				
+		short	description_ind;		
+		short	rental_ind;					
+		short	free_applied_on_ind;				
+		short	free_in_bytes_ind;		
+		short	free_out_bytes_ind;				
+		short	free_minutes_ind;	
+		short	activated_on_ind;		
+		short	deactivated_on_ind;
+		short	package_type_ind;
+		short	free_units_ind;	
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+	char	t_start_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,gsm_connections->start_date.c_str());
+	
+	int i;
+	packages p;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new packages_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for packages fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_packages CURSOR FOR
+	SELECT	PACKAGE_CODE,				
+			DESCRIPTION,
+			RENTAL,		
+			FREE_APPLIED_ON,					
+			FREE_IN_BYTES,				
+			FREE_OUT_BYTES,		
+			FREE_MINUTES,				
+			ACTIVATED_ON,	
+			DEACTIVATED_ON,
+			PACKAGE_TYPE,
+			FREE_UNITS			
+	FROM	MIRRORED_BILL_PACKAGES
+	WHERE PACKAGE_TYPE = 'O'
+	AND	TRUNC(BILL_PERIOD_START) = to_date(:t_start_date,'YYYYMMDD'); 
+	       
+    EXEC SQL AT ISP  OPEN c_packages; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_packages INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			strcpy(a[i].package_code,
+				  ((a_ind[i].package_code_ind < 0) ? "UNDEF":a[i].package_code));
+			strcpy(a[i].description,
+				  ((a_ind[i].description_ind < 0) ? "UNDEF":a[i].description));
+			a[i].rental = (a_ind[i].rental_ind < 0) ? 0.0 : a[i].rental ;
+			strcpy(a[i].free_applied_on,
+				  ((a_ind[i].free_applied_on_ind < 0) ? "UNDEF":a[i].free_applied_on));
+			a[i].free_in_bytes = (a_ind[i].free_in_bytes_ind < 0) ? 0.0 : a[i].free_in_bytes ;
+			a[i].free_out_bytes = (a_ind[i].free_out_bytes_ind < 0) ? 0.0 : a[i].free_out_bytes ;
+			a[i].free_minutes = (a_ind[i].free_minutes_ind < 0) ? 0.0 : a[i].free_minutes ;
+			strcpy(a[i].activated_on,
+				  ((a_ind[i].activated_on_ind < 0) ? "UNDEF":a[i].activated_on));
+			strcpy(a[i].deactivated_on,
+				  ((a_ind[i].deactivated_on_ind < 0) ? "UNDEF":a[i].deactivated_on));
+			strcpy(a[i].package_type,
+				  ((a_ind[i].package_type_ind < 0) ? "UNDEF":a[i].package_type));
+			a[i].free_units = (a_ind[i].free_units_ind < 0) ? 0.0 : a[i].free_units ;
+			
+			//assining values fetched from db to the packages class
+			p.package_code			= a[i].package_code;				
+			p.description			= a[i].description;		
+			p.rental				= a[i].rental;					
+			p.free_applied_on		= a[i].free_applied_on;				
+			p.free_in_bytes			= a[i].free_in_bytes;		
+			p.free_out_bytes		= a[i].free_out_bytes;				
+			p.free_minutes			= a[i].free_minutes;	
+			p.activated_on			= a[i].activated_on;		
+			p.deactivated_on		= a[i].deactivated_on;
+			p.package_type			= a[i].package_type;
+			p.free_units			= a[i].free_units;	
+			
+			
+			gsm_packages->all_packages[p.package_code] = p;
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_packages; 
+	delete a;
+	printf("%d  packages records read.\n\n",rows_before);
+} 
+
+// file:db_useage_summary
+
+
+void connections::db_insert_bill_summary_items_raw()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	char	b_BILL_NO[15];			//	NUMBER(10)
+	char	b_ITEM_CODE[20];		//	VARCHAR2(10)
+	float	b_VALUE;				//	NUMBER(12,2)
+	float	b_VALUE_VAT;			//  ???
+	EXEC SQL END DECLARE SECTION;
+
+	// initalise account number & invoice number common for all items in bill summary
+
+	strncpy(b_BILL_NO, (current->connection.invoice_no).c_str(),10);
+
+	b_BILL_NO[10] = '\0';
+
+	for(BILL_SUMMARY_DEF::iterator i=summary.begin(); i!=summary.end(); i++)
+	{
+		strcpy(b_ITEM_CODE, (*i).first.c_str());
+		b_VALUE		= (*i).second.amount;
+		b_VALUE_VAT = (*i).second.vat_amount;
+
+		EXEC SQL 
+		AT ISP 
+		INSERT INTO BILL_SUMMARY_ITEMS_RAW (BILL_NO,
+		  ITEM_CODE, AMOUNT, VAT_AMOUNT) VALUES (:b_BILL_NO, :b_ITEM_CODE, :b_VALUE, :b_VALUE_VAT);
+	}
+	
+	//printf("bill_summary_items updated ");
+
+}
+
+
+// file:db_taxes
+
+void taxes::db_read_tax_items()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct tax_s 
+	{ 
+		 char tax_type_id[6];	//	VARCHAR2(5)		// 6 instead of BUF_LEN
+		 float tax_rate;				//	NUMBER(5,2)
+		 float tax_slab;				//	NUMBER(14,2)
+	} a, *tp; 
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC ORACLE OPTION (char_map=string) ;
+
+	int i;
+	tax_items	ti;		
+	tp = &a;
+ 
+    EXEC SQL AT ISP DECLARE c_tax CURSOR FOR 
+	SELECT	TAX_TYPE_ID, TAX_RATE, TAX_SLAB 
+	FROM	TAX_ITEMS;
+       
+    EXEC SQL AT ISP OPEN c_tax; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT ISP FETCH c_tax INTO :tp; 
+
+		ti.tax_type_id	= tp->tax_type_id;
+		ti.tax_slab		= tp->tax_slab;
+		ti.tax_rate		= tp->tax_rate;
+
+		gsm_taxes->tax_items_map[ti.tax_type_id] = ti;
+	} 
+
+    EXEC SQL AT ISP CLOSE c_tax; 
+ 
+    printf("\n %d  tax items loaded.\n\n",i);
+}
+
+void taxes::db_read_tax_group_items()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct tax_group_s 
+	{ 
+		 char tax_group_id[BUF_LEN];	//	VARCHAR2(5)		
+		 char tax_type_id[6];			//	VARCHAR2(5)		//  6 instead of BUF_LEN
+		 int  priority;					//  NUMBER(1)
+	} a, *tp; 
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC ORACLE OPTION (char_map=string) ;
+
+	int i;
+	tp = &a;
+ 
+    EXEC SQL AT ISP DECLARE c_tax_group CURSOR FOR 
+	SELECT	TAX_GROUP_ID, TAX_TYPE_ID, PRIORITY 
+	FROM	TAX_GROUP_ITEMS;
+       
+    EXEC SQL AT ISP OPEN c_tax_group; 
+ 
+    EXEC SQL WHENEVER NOT FOUND DO break; 
+
+    for (i=0; ;i++) 
+    { 
+        EXEC SQL AT ISP FETCH c_tax_group INTO :tp; 
+
+		
+		tax_key tk;
+		tk.type = tp->tax_type_id;
+		tk.group = tp->tax_group_id;
+		tk.priority = tp->priority;
+
+		TAX_ITEMS_DEF::iterator it=gsm_taxes->tax_items_map.find(tk.type);
+
+	
+		tk.slab = (*it).second.tax_slab;
+	
+		insert(tk, (*it).second.tax_rate);
+	} 
+
+    EXEC SQL AT ISP CLOSE c_tax_group; 
+ 
+    printf("\n %d  tax_group_items loaded.\n\n",i);
+}
+
+
+//-- connection_discounts
+void discounts::db_read_connection_discounts()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection_discounts_t
+	{
+		char	client_code[BUF_LEN];	// varchar2(8)
+		char	discount_type[6];		// 6 instead of BUF_LEN	// varchar2(5)
+		int		account_no;				// number(10)
+	} *a;
+
+	struct connection_discounts_ind
+	{ 
+  		short	client_code_ind;
+		short	discount_type_ind;
+		short	account_no_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new connection_discounts_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connection_discounts fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_connection_discounts CURSOR FOR 
+	SELECT	CLIENT_CODE,
+			DISCOUNT_TYPE,		
+			ACCOUNT_NO
+	FROM	CONNECTION_DISCOUNTS; 
+	       
+    EXEC SQL AT ISP  OPEN c_connection_discounts; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_connection_discounts INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].discount_type,
+				  ((a_ind[i].discount_type_ind < 0) ? "UNDEF":a[i].discount_type));
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no;
+			
+			
+			//Inserting to connection_discount_map
+
+			insert_connection_discount(a[i].account_no, a[i].discount_type);
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_connection_discounts; 
+	delete a;
+	printf("%d  connection_discounts records read.\n\n",rows_before);
+}  
+
+//-- discounts::discount_types
+void discounts::db_read_discount_types()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct discount_types_t
+	{
+		char	discount_type[6];		// 6 instead of BUF_LEN
+		char	description[BUF_LEN];
+	} *a;
+
+	struct discount_types_ind
+	{ 
+  		short	discount_type_ind;
+		short	description_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new discount_types_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for discount_types fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_discount_types CURSOR FOR 
+	SELECT	DISCOUNT_TYPE,				
+			DESCRIPTION		
+	FROM	DISCOUNT_TYPES; 
+	       
+    EXEC SQL AT ISP  OPEN c_discount_types; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_discount_types INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].discount_type,
+				  ((a_ind[i].discount_type_ind < 0) ? "UNDEF":a[i].discount_type));
+			strcpy(a[i].description,
+				  ((a_ind[i].description_ind < 0) ? "UNDEF":a[i].description));
+
+			discount_type_map[a[i].discount_type] = a[i].discount_type;
+
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_discount_types; 
+	delete a;
+	printf("%d  discount_types records read.\n\n",rows_before);
+}  
+
+
+//-- discount_rules
+void discounts::db_read_discount_rules()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct discount_rules_t
+	{
+		char	discount_type[6];		// 6 instead of BUF_LEN
+		int		rule_number;
+		float	percentage;
+		float	rate;
+		char	content_or_duration[2];	// 2 instead of BUF_LEN
+		char	rental_waived[2];		// 2 instead of BUF_LEN
+		float	upper_limit;			// number(14,2)
+		float	lower_limit;
+		char	time_band_group[BUF_LEN];
+		char	time_band_type[BUF_LEN];
+		char	day_id[BUF_LEN];
+	} *a;
+
+	struct discount_rules_ind
+	{ 
+  		short	discount_type_ind;
+		short	rule_number_ind;
+		short	percentage_ind;
+		short	rate_ind;
+		short	content_or_duration_ind;
+		short	rental_waived_ind;
+		short	upper_limit_ind;
+		short	lower_limit_ind;
+		short	time_band_group_ind;
+		short	time_band_type_ind;
+		short	day_id_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	TimeBand tb;
+	discount_rule dr;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new discount_rules_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for discount_rules fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_discount_rules CURSOR FOR 
+	SELECT	DISCOUNT_TYPE,				
+			RULE_NUMBER,		
+			PERCENTAGE,
+			RATE,
+			CONTENT_OR_DURATION,
+			RENTAL_WAIVED,
+			UPPER_LIMIT,
+			LOWER_LIMIT,
+			TIME_BAND_GROUP,
+			TIME_BAND_TYPE,
+			DAY_ID					
+	FROM	DISCOUNT_RULES; 
+	       
+    EXEC SQL AT ISP  OPEN c_discount_rules; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_discount_rules INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].discount_type,
+				  ((a_ind[i].discount_type_ind < 0) ? "UNDEF":a[i].discount_type));
+			strcpy(a[i].rental_waived,
+				  ((a_ind[i].rental_waived_ind < 0) ? "UNDEF":a[i].rental_waived));
+			strcpy(a[i].content_or_duration,
+				  ((a_ind[i].content_or_duration_ind < 0) ? "UNDEF":a[i].content_or_duration));
+			strcpy(a[i].time_band_group,
+				  ((a_ind[i].time_band_group_ind < 0) ? "UNDEF":a[i].time_band_group));
+			strcpy(a[i].time_band_type,
+				  ((a_ind[i].time_band_type_ind < 0) ? "UNDEF":a[i].time_band_type));
+			strcpy(a[i].day_id,
+				  ((a_ind[i].day_id_ind < 0) ? "UNDEF":a[i].day_id));
+			a[i].rule_number = (a_ind[i].rule_number_ind < 0) ? 0.0 : a[i].rule_number;
+			a[i].percentage = (a_ind[i].percentage_ind < 0) ? 0.0 : a[i].percentage;
+			a[i].rate = (a_ind[i].rate_ind < 0) ? 0.0 : a[i].rate;
+			a[i].upper_limit = (a_ind[i].upper_limit_ind < 0) ? 0.0 : a[i].upper_limit;
+			a[i].lower_limit = (a_ind[i].lower_limit_ind < 0) ? 0.0 : a[i].lower_limit;
+
+			//assining values fetched from db to the discount_rule class
+			dr.discount_type	= a[i].discount_type;				
+			dr.rental_waived	= a[i].rental_waived;		
+			dr.rule_number		= a[i].rule_number;					
+			dr.percentage		= a[i].percentage;
+			dr.rate				= a[i].rate;
+			dr.content_or_duration		= a[i].content_or_duration;
+			dr.upper_limit		= a[i].upper_limit;
+			dr.lower_limit		= a[i].lower_limit;	
+			
+			//assining values fetched from db to the TimeBand class
+			tb.time_band_group	= a[i].time_band_group; 
+			tb.time_band_type	= a[i].time_band_type;	
+			tb.day_id			= a[i].day_id;
+			
+			fprintf(logfile, "%s%s", "\ntime_band_group : " , dr.time_band.time_band_group.c_str() );
+			fprintf(logfile, "%s%s", "\ntime_band_type : " , dr.time_band.time_band_type.c_str() );
+			fprintf(logfile, "%s%s", "\nday_id : " , dr.time_band.day_id.c_str() );
+			
+
+			//  rule_type clasification
+			/*
+			23-07-2000
+			Table - discount_rules
+			hierarchy day_id > time_band_group > time_band_type
+			If content_or_duration 'M'							- rule_type = 1
+			If time_band_type, time_band_group, day_id NOT NULL	- rule_type = 2
+			If time_band_group, time_band_type NOT NULL	others NULL		- rule_type = 3
+			If day_id NOT NULL others NULL						- rule_type = 4
+			*/
+			if (dr.content_or_duration == "M")
+			{
+				dr.rule_type = 1;
+				fprintf(logfile, "%s", "\nrule_type = 1" );
+			}
+			else if (a_ind[i].time_band_type_ind == 0) 
+				{
+					dr.rule_type = 2;
+					fprintf(logfile, "%s", "\nrule_type = 2" );
+				}
+				else if (a_ind[i].time_band_group_ind == 0)
+					{
+						dr.rule_type = 3;
+						tb.time_band_type	= "WILD_CARD";
+						fprintf(logfile, "%s","\nrule_type = 3" );
+					}
+					else if (a_ind[i].time_band_group_ind < 0)
+						{
+							dr.rule_type = 4;
+							tb.time_band_group	= "WILD_CARD"; 
+							tb.time_band_type	= "WILD_CARD";
+							fprintf(logfile, "%s", "\nrule_type = 4" );
+						}
+
+			dr.time_band		= tb;
+
+			insert(a[i].discount_type, dr);
+			
+
+			fprintf(logfile, "%s%d", "\nRule multimap size :" , discount_rule_multimap.size() );
+			
+			//cout <<"Discount type at rule : " << a[i].discount_type << endl;
+		}
+	} 
+
+	fprintf(logfile, "%s%d", "\nRule multimap size :" , discount_rule_multimap.size() );
+
+	EXEC SQL AT ISP CLOSE c_discount_rules; 
+	delete a;
+	printf("%d  discount_rules records read.\n\n",rows_before);
+}  
+
+//-- bill_account_adjustments
+void connections::db_read_bill_account_adjustments()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection_t
+	{
+		int		account_no;
+		char	adjustment_type[BUF_LEN];		
+		float	amount_adjusted;
+		char	disapproved_reason[BUF_LEN];
+		char	processed[2];				// 2 instead of BUF_LEN
+		int		reference_no;				// varchar2(10)
+	} *a;
+
+	struct connection_ind
+	{ 
+  		short	account_no_ind;
+		short	adjustment_type_ind;
+		short	amount_adjusted_ind;
+		short	disapproved_reason_ind;
+		short	processed_ind;
+		short	reference_no_ind;
+	}a_ind[FETCH_SIZE];
+
+	int t_start_ac, t_end_ac;
+	int rows_to_fetch, rows_before, rows_this_time;
+	char t_start_date[20];
+	char t_end_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	t_start_ac = start_ac_no;
+	t_end_ac = end_ac_no;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+	
+	
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new connection_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connection fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_bill_account_adjustments CURSOR FOR 
+	SELECT	ACCOUNT_NO,				
+			ADJUSTMENT_TYPE,		
+			AMOUNT_ADJUSTED,					
+			DISAPPROVED_REASON,				
+			PROCESSED,
+			REFERENCE_NO
+	FROM	BILL_ACCOUNT_ADJUSTMENTS 
+	WHERE TRUNC(APPROVED_DATE) >= to_date(:t_start_date,'YYYYMMDD') AND TRUNC(APPROVED_DATE) <= to_date(:t_end_date,'YYYYMMDD');
+       
+    EXEC SQL AT ISP  OPEN c_bill_account_adjustments; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_bill_account_adjustments INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].adjustment_type,
+				  ((a_ind[i].adjustment_type_ind < 0) ? "UNDEF":a[i].adjustment_type));
+			strcpy(a[i].disapproved_reason,
+				  ((a_ind[i].disapproved_reason_ind < 0) ? "UNDEF":a[i].disapproved_reason));
+			strcpy(a[i].processed,
+				  ((a_ind[i].processed_ind < 0) ? "UNDEF":a[i].processed));
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no;
+			a[i].amount_adjusted = (a_ind[i].amount_adjusted_ind < 0) ? 0.0 : a[i].amount_adjusted;
+			a[i].reference_no = (a_ind[i].reference_no_ind < 0) ? 0 : a[i].reference_no;
+			
+			adjustment_item ai;
+			ai.adjustment_type = a[i].adjustment_type;
+			ai.amount_adjusted = a[i].amount_adjusted;
+			ai.reference_no	   = a[i].reference_no;
+
+			if(set_current(a[i].account_no))
+			{
+				
+				gsm_connections->adjustment_item_multimap.insert(pair<int, adjustment_item>(a[i].account_no, ai));
+				
+				BILL_ADJUSTMENT_TYPE_DEF::iterator i = current->charge.adjustment_items_value_map.find(ai.adjustment_type);
+				if ( i == current->charge.adjustment_items_value_map.end() )
+				{
+					cout << "Undefined adjustment type in BILL_ACCOUNT_ADJUSTMENTS table" << endl;
+					cout << "Account no: " << current->connection.account_no << endl;
+					cout << "Exiting with Error" << endl;
+					exit(0);
+				}
+				else
+				{
+					(*i).second.value += ai.amount_adjusted;
+					
+					if ( (*i).second.tax == true )
+					{
+						current->charge.taxable_adjustment += ai.amount_adjusted;
+					}
+					else
+					{
+						current->charge.untaxable_adjustment += ai.amount_adjusted;
+					}
+				}
+			}
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_bill_account_adjustments; 
+	delete a;
+	printf("%d  bill_account_adjustments records read.\n\n",rows_before);
+} 
+
+
+//-- bill_account_adjustments update
+void connections::db_update_bill_account_adjustments()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	
+	int t_start_ac, t_end_ac;
+	
+	EXEC SQL END DECLARE SECTION;
+
+	t_start_ac = start_ac_no;
+	t_end_ac = end_ac_no;
+
+	EXEC SQL 
+	AT ISP 
+	UPDATE	bill_account_adjustments				
+			SET PROCESSED = 'Y'
+	WHERE	ACCOUNT_NO >= :t_start_ac AND  ACCOUNT_NO<= :t_end_ac 
+	AND		PROCESSED = 'N'; 
+
+	printf("bill_account_adjustments records updated");
+} 
+
+//-- bill_account_adjustments update for one connection
+void connections::db_update_bill_account_adjustments_for_one_connection(int account_no)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	
+	int b_account_no;
+	char b_bill_no[15];
+	
+	EXEC SQL END DECLARE SECTION;
+
+	b_account_no = account_no;
+	strcpy(b_bill_no, current->connection.invoice_no.c_str());
+
+	fprintf(logfile, "%s%d",  "\nb_account_no :",b_account_no );
+
+	
+	EXEC SQL 
+	AT ISP 
+	UPDATE	bill_account_adjustments				
+			SET PROCESSED = 'Y',
+			APPLIED_TO_BILL_NO = :b_bill_no
+	WHERE	ACCOUNT_NO = :b_account_no 
+	AND		PROCESSED = 'N'; 
+
+	//printf("bill_account_adjustments records updated for one connection");
+	fprintf(logfile, "%s",  "\nbill_account_adjustments records updated for one connection" );
+
+} 
+
+void connections::db_insert_bill_master_open()
+{
+
+EXEC SQL BEGIN DECLARE SECTION;
+	char  b_bill_no[20];		// varcahr2(10)		not null,
+	char  b_client_code[50];	// varchar2(8)		not null,
+ 	int   b_account_no;			// number(10)		not null,
+	char  b_start_date[10];		// date 			not null,
+	char  b_end_date[10];		// date				not null,
+	float b_balance_bf;			// number(14,2)		not null,
+	char  b_br_code[50];		// varchar2(2)		not null,
+	float b_balance_cf;			// number(14,2)		not null -- for next bill (bf-payments+bill_amount)
+	int	  b_run_no;				// number(5)
+EXEC SQL END DECLARE SECTION;
+
+// initalise account number & invoice number common for all items in bill summary
+
+	
+	b_bill_no[10] = '\0';
+	strcpy(b_client_code, (current->connection.client_code).c_str());
+	b_client_code[8] = '\0';
+	b_account_no = current->connection.account_no;
+	b_balance_cf = current->call.charge + current->charge.rental + current->charge.pro_rate + current->charge.adjustment - current->charge.discounts + current->charge.tax + current->charge.brought_forward - current->charge.payments;
+	b_balance_bf = current->charge.c_f;	// This month's c/f is the next month's b/f
+	b_run_no = 1;		// Should get from db_pre_bill() - refer following line
+	strcpy(b_start_date,(gsm_connections->start_date).c_str());
+	strcpy(b_end_date,(gsm_connections->end_date).c_str());
+	strcpy(b_br_code,gsm_bill_cycle->bill_cycle_code.c_str());
+	
+	for(int i=0; i<1; i++)
+	{
+		EXEC SQL 
+		AT ISP 
+		INSERT INTO BILL_MASTER
+		(
+			CLIENT_CODE, 
+			ACCOUNT_NO,
+			BILL_NO,
+			BILL_PERIOD_START,
+			BILL_PERIOD_END, 
+			BALANCE_BF,
+			BILL_RUN_CODE,
+			BILL_AMOUNT 
+		)
+			VALUES
+		(
+			:b_client_code,
+			:b_account_no,
+			:b_bill_no,
+			to_date(to_char((ADD_MONTHS(to_date(:b_start_date,'YYYYMMDD'),+1)),'YYYYMMDD'),'YYYYMMDD'),
+			to_date(to_char((ADD_MONTHS(to_date(:b_end_date,'YYYYMMDD'),+1)),'YYYYMMDD'),'YYYYMMDD'),
+			:b_balance_bf,
+			:b_br_code,
+			 0
+		);
+	}
+	//EXEC SQL AT ISP COMMIT; 
+
+	//printf("bill master updated for open bill");
+}
+
+void connections::db_insert_bill_master_raw()
+{
+
+EXEC SQL BEGIN DECLARE SECTION;
+	char  ub_bill_no[50];			// varcahr2(10)		not null,
+	char  ub_client_code[50];		// varchar2(8)		not null,
+ 	int   ub_account_no;			// number(10)		not null,
+	char  ub_start_date[10];		// date 			not null,
+	char  ub_end_date[10];			// date				not null,
+	char  ub_due_date[10];			// date 			not null,
+	float ub_balance_bf;			// number(14,2)		not null,
+	float ub_bill_payments;			// number(14,2)		not null,
+	char  ub_br_code[50];			// varchar2(2)		not null,
+	float ub_total_bill_value;		// number(14,2)		not null,
+	float ub_balance_cf;			// number(14,2)		not null -- for next bill (bf-payments+bill_amount)
+	int	  ub_run_no;				// number(5)
+	char  ub_user_id[20];			// varchar2(30)
+	char  b_sys_date[10];			// sysdate  -  YYYYMMDD	
+EXEC SQL END DECLARE SECTION;
+
+	strcpy(b_sys_date, gsm_connections->sys_date.c_str());
+	int position = strcspn( current->call.user_id.c_str(), " " );
+	if ( position==0 ) 
+	{
+		current->call.user_id = current->call.user_id.substr(0,strcspn( current->call.user_id.c_str(), " " ));
+	}
+	else
+	{
+		current->call.user_id[position] = '\0';
+	}
+	
+	strcpy(ub_user_id, current->call.user_id.c_str());
+	strcpy(ub_bill_no, (current->connection.invoice_no).c_str());
+	ub_bill_no[10] = '\0';
+ 	ub_account_no = current->connection.account_no;
+	strcpy(ub_client_code, (current->connection.client_code).c_str());
+	ub_client_code[8] = '\0';
+	strcpy(ub_start_date, start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	strcpy(ub_due_date, due_date.c_str());
+	strcpy(ub_br_code,gsm_bill_cycle->bill_cycle_code.c_str());
+	ub_balance_bf = current->charge.brought_forward;
+	ub_run_no = 1;		// Should get from db_pre_bill() - refer following line
+	ub_total_bill_value = current->charge.bill_amount;
+	ub_balance_bf = current->charge.brought_forward;
+	ub_balance_cf = current->charge.c_f;
+	ub_bill_payments = current->charge.payments;
+	
+
+
+	/*
+	cout<<" ub_bill_no="<<ub_bill_no
+		<<" ub_account_no="<<ub_account_no
+		<<" ub_start_date="<<ub_start_date
+		<<" ub_end_date="<<ub_end_date
+		<<" ub_due_date="<<ub_due_date
+		<<" ub_balance_bf="<<ub_balance_bf
+		<<" ub_bill_payments="<<ub_bill_payments
+		<<" ub_br_code="<<ub_br_code
+		<<" ub_total_bill_value="<<ub_total_bill_value
+		<<" ub_balance_cf="<<ub_balance_cf
+		<<" ub_run_number="<<ub_run_no
+		<<" ub_user_id="<<ub_user_id
+		<<" ub_corporate_bill_code="<<ub_corporate_bill_code<<endl;
+	*/
+	
+
+	
+		EXEC SQL 
+		AT ISP 
+		INSERT INTO BILL_MASTER_RAW
+		(
+			CLIENT_CODE,
+			ACCOUNT_NO,
+			BILL_DATE,
+			PROCESSED_DATE,
+			BILL_PERIOD_START,
+			BILL_PERIOD_END,
+			DUE_DATE,
+			BILL_RUN_CODE,
+			BILL_AMOUNT,
+			BALANCE_BF,
+			BILL_PAYMENTS,
+			BALANCE_CF,
+			RUN_NO,
+			USER_ID,
+			BILL_NO 
+		)
+			VALUES
+		(
+			:ub_client_code,
+			:ub_account_no,
+			to_date(:ub_end_date,'YYYYMMDD'),
+			to_date(:b_sys_date,'YYYYMMDD'),
+			to_date(:ub_start_date,'YYYYMMDD'), 
+			to_date(:ub_end_date,'YYYYMMDD'), 
+			to_date(:ub_due_date,'YYYYMMDD'),
+			:ub_br_code, 
+			:ub_total_bill_value,
+			:ub_balance_bf,
+			:ub_bill_payments,
+			:ub_balance_cf,
+			:ub_run_no,
+			:ub_user_id,
+			:ub_bill_no 	 
+		); 
+
+	//printf("bill master updated -------------");
+	fprintf(logfile, "%s",  "\nbill_master_rad inserted");
+
+
+}
+
+
+
+
+
+//-- rental_advance_payments
+void connections::db_read_rental_advance_payments()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct rental_advance_payments_t
+	{
+			char	client_code[8];		// varchar2(8)			
+			char	date_paid[BUF_LEN];			// date
+			int		no_of_months_free;					
+			int		no_of_months_paid;				
+			int		account_no;		
+			int		balance_months;				
+	} *a;
+
+	struct rental_advance_payments_ind
+	{ 
+  		short	client_code_ind;				
+		short	date_paid_ind;		
+		short	no_of_months_free_ind;					
+		short	no_of_months_paid_ind;				
+		short	account_no_ind;		
+		short	balance_months_ind;				
+	}a_ind[FETCH_SIZE];
+
+	char t_start_date[20];
+	int rows_to_fetch, rows_before, rows_this_time;
+	char ub_end_date[15];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	advance_payment	ap;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new rental_advance_payments_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for rental_advance_payments fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_rental_advance_payments CURSOR FOR
+	SELECT	CLIENT_CODE,				
+			DATE_PAID,
+			NO_OF_MONTHS_FREE,		
+			NO_OF_MONTHS_PAID,					
+			ACCOUNT_NO,				
+			BALANCE_MONTHS		
+	FROM	MIRRORED_BILL_RENT_ADV_PAYMTS
+	WHERE	TRUNC(DATE_PAID) <= to_date(:ub_end_date,'YYYYMMDD')
+	AND	TRUNC(BILL_PERIOD_START) = to_date(:t_start_date,'YYYYMMDD')
+	ORDER BY DATE_PAID DESC; 
+       
+    EXEC SQL AT ISP  OPEN c_rental_advance_payments; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_rental_advance_payments INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].date_paid,
+				  ((a_ind[i].date_paid_ind < 0) ? "UNDEF":a[i].date_paid));
+			a[i].no_of_months_free = (a_ind[i].no_of_months_free_ind < 0) ? 0.0 : a[i].no_of_months_free;
+			a[i].no_of_months_paid = (a_ind[i].no_of_months_paid_ind < 0) ? 0.0 : a[i].no_of_months_paid;
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no;
+			a[i].balance_months = (a_ind[i].balance_months_ind < 0) ? 0.0 : a[i].balance_months;
+			
+
+			if (a[i].balance_months > 0)
+			{
+				ap.account_no		= a[i].account_no;
+				ap.client_code		= a[i].client_code;						
+				ap.date_paid		= a[i].date_paid;						
+				ap.balance_months	= a[i].balance_months;
+							
+				gsm_connections->rental_advance_payments_map[a[i].account_no] = ap;
+			}
+
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_rental_advance_payments; 
+	delete a;
+	printf("%d  rental_advance_payments records read.\n\n",rows_before);
+} 
+
+
+//-- rental_advance_payments update
+void connections::db_update_rental_advance_payments(int	account_no, string client_code,string date_paid)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	int		up_account_no;
+	char	up_client_code[BUF_LEN];
+	char	up_date_paid[BUF_LEN];
+
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(up_client_code,client_code.c_str());
+	strcpy(up_date_paid, date_paid.c_str());
+	up_account_no = account_no;
+
+	int  pos;
+	pos = strcspn( up_client_code, " " );
+	up_client_code[pos]='\0';
+ 
+    EXEC SQL 
+	AT ISP 
+	UPDATE	RENTAL_ADVANCE_PAYMENTS				
+			SET BALANCE_MONTHS = BALANCE_MONTHS-1
+	WHERE	to_date(to_char(DATE_PAID,'DD-MON-YY'),'DD-MON-YY') = to_date(:up_date_paid,'DD-MON-YY') AND 
+	CLIENT_CODE = :up_client_code AND
+	ACCOUNT_NO = :up_account_no; 
+
+	//printf("rental_advance_payments records updated");
+	//cout << "rental_advance_payments records updated for account no: " << account_no << endl;
+} 
+
+
+//-- truncate interim_bill_summary_items
+void connections::truncate_interim_bill_summary_items()
+{
+	
+    EXEC SQL 
+	AT ISP 
+	TRUNCATE TABLE INTERIM_BILL_SUMMARY_ITEMS;				
+			
+	printf("interim_bill_summary_items truncated");
+}
+
+//-- work_orders update
+void connections::db_update_work_orders(int	work_order_no)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	int		up_work_order_no;
+	
+	EXEC SQL END DECLARE SECTION;
+
+	
+	up_work_order_no = work_order_no;
+
+    EXEC SQL 
+	AT ISP 
+	UPDATE	WORK_ORDERS				
+			SET STATUS = 'N'
+	WHERE	WORK_ORDER_NO = :up_work_order_no;
+	
+	//printf("work_orders updated");
+}
+
+
+//-- bill_summary_item_defs
+void connections::db_read_bill_summary_item_defs()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	int cash_transact_type;
+	int cash_transact_type_rental_adv_pay;
+	char debit_acc_type[5];						// varchar2(5)
+	char credit_acc_type[5];					// varchar2(5)
+	char debit_acc_type_rental_adv_pay[5];		// varchar2(5)
+	char credit_acc_type_rental_adv_pay[5];		// varchar2(5)
+		
+	EXEC SQL END DECLARE SECTION;
+
+	
+    EXEC SQL 
+	AT ISP 
+	SELECT	CASH_TRANSACTION_TYPE
+	INTO :cash_transact_type				
+	FROM	BILL_SUMMARY_ITEM_DEFS 
+	WHERE	ITEM_CODE = 'TOT_PAY';
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	CASH_TRANSACTION_TYPE
+	INTO :cash_transact_type_rental_adv_pay				
+	FROM	BILL_SUMMARY_ITEM_DEFS 
+	WHERE	ITEM_CODE = 'RENT_ADV_DEDUCT';
+	
+	cout << "bill_summary_item_defs  read." << endl;
+	fprintf(logfile, "%s", "\nbill_summary_item_defs  read.");
+
+	fprintf(logfile, "%s%d","\ncash_transaction_type : " , cash_transact_type );
+	fprintf(logfile, "%s%d","\ncash_transact_type_rental_adv_pay : " , cash_transact_type_rental_adv_pay );
+
+	cash_transaction_type = cash_transact_type;
+	cash_transaction_type_rental_adv_pay = cash_transact_type_rental_adv_pay;
+
+	// allowed_cash_transactions
+	
+	EXEC SQL 
+	AT ISP 
+	SELECT	DEBIT_ACC_TYPE,
+			CREDIT_ACC_TYPE
+	INTO	:debit_acc_type,
+			:credit_acc_type				
+	FROM	ALLOWED_CASH_TRANSACTIONS 
+	WHERE	CASH_TRANSACTION_TYPE = :cash_transact_type;
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	DEBIT_ACC_TYPE,
+			CREDIT_ACC_TYPE
+	INTO	:debit_acc_type_rental_adv_pay,
+			:credit_acc_type_rental_adv_pay				
+	FROM	ALLOWED_CASH_TRANSACTIONS 
+	WHERE	CASH_TRANSACTION_TYPE = :cash_transact_type_rental_adv_pay;
+
+
+	cout << "allowed_cash_transactions  read." << endl;
+	fprintf(logfile, "%s", "\nallowed_cash_transactions  read.");
+	
+	debit_acc_type[strcspn( debit_acc_type, " " )] = '\0';
+	credit_acc_type[strcspn( credit_acc_type, " " )] = '\0';
+	debit_acc_type_rental_adv_pay[strcspn( debit_acc_type_rental_adv_pay, " " )] = '\0';
+	credit_acc_type_rental_adv_pay[strcspn( credit_acc_type_rental_adv_pay, " " )] = '\0';
+
+
+	debit_account_type	= debit_acc_type;
+	credit_account_type	= credit_acc_type;
+	debit_account_type_rental_adv_pay	= debit_acc_type_rental_adv_pay;
+	credit_account_type_rental_adv_pay	= credit_acc_type_rental_adv_pay;
+
+	fprintf(logfile, "%s%s", "\ndebit_account_type  :" , debit_account_type.c_str() );
+	fprintf(logfile, "%s%s", "\ncredit_account_type  :" , credit_account_type.c_str() );
+	fprintf(logfile, "%s%s", "\ndebit_account_type_rental_adv_pay  :" , debit_account_type_rental_adv_pay.c_str() );
+	fprintf(logfile, "%s%s","\ncredit_account_type_rental_adv_pay  :" , credit_account_type_rental_adv_pay.c_str() );
+
+}
+
+
+
+// billrun_definitions
+
+void connections::db_read_billrun_definitions()
+{
+
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	 char	br_br_code[10];			//	VARCHAR2(5)		
+	 int	br_start_day;				//	NUMBER(2)
+	 int	br_bill_grace_period;		//	NUMBER(3)
+	 char	br_system_date[20];
+	 char	br_temp_date[20];
+	 char	br_start_date[20];
+	 char	br_end_date[20];
+	 char	br_due_date[20];
+	 char	bill_cycle_code[6];			
+			 
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(bill_cycle_code, gsm_bill_cycle->bill_cycle_code.c_str());
+
+	EXEC SQL WHENEVER NOT FOUND DO not_found_error("No relevant entry in billrun_definitions"); 
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	BR_CODE, START_DAY, BILL_GRACE_PERIOD 
+	INTO	:br_br_code, 
+			:br_start_day, 
+			:br_bill_grace_period
+	FROM	BILLRUN_DEFINITIONS
+	WHERE BR_CODE = :bill_cycle_code
+	AND ACTIVE = 'Y';
+
+	br_br_code[strcspn( br_br_code, " " )] = '\0';
+
+	br_code = br_br_code;
+	start_day = br_start_day;
+	bill_grace_period = br_bill_grace_period;
+
+	cout << "billrun_definitions  read." << endl;
+	cout << "br_code : " << br_code ;
+	//cout << "start_day : " << start_day << endl;
+	//cout << "bill_grace_period : " << bill_grace_period << endl;
+	
+     
+	EXEC SQL 
+	AT ISP 
+	SELECT	to_char(sysdate,'YYYYMMDD')
+	INTO	:br_system_date
+	FROM	DUAL;
+
+	//cout << "Sysdate : " << br_system_date << endl;
+
+	char sysday[2];
+
+	sysday[0]	= br_system_date[6];
+	sysday[1]	= br_system_date[7];
+	sysday[2]	= '\0';
+
+	//cout << "sysday :" << sysday <<"END" << endl;
+
+	int IntSysday = atoi(sysday);
+
+	//cout << "IntSysday :" << IntSysday <<"END" << endl;
+
+
+	char buf[30];
+	char day[2];
+	
+	strncpy(buf, br_system_date, 6);
+	
+	if (start_day >9)
+	{
+		myitoa(start_day, day);
+		strncpy( buf + 6, day, 2 );
+	}
+	else
+	{
+		char pad[1];
+		pad[0] = '0';
+		strncpy( buf + 6, pad, 1 );
+		myitoa(start_day, day);
+		strncpy( buf + 7, day, 1 );
+	}
+
+	buf[8] = '\0'; 
+	
+	//cout << "buf : " << buf;
+
+	strcpy(br_temp_date, buf);
+
+	br_temp_date[8] = '\0'; 
+
+	//cout << "br_temp_date  : " << br_temp_date ;
+
+	if (IntSysday >= br_start_day)
+	{
+		EXEC SQL 
+		AT ISP 
+		SELECT	to_char((ADD_MONTHS(to_date(:br_temp_date,'YYYYMMDD'),-1)),'YYYYMMDD')
+		INTO	:br_start_date
+		FROM	DUAL;
+
+		//cout <<"up"<<endl;
+	}
+	else
+	{
+		EXEC SQL 
+		AT ISP 
+		SELECT	to_char((ADD_MONTHS(to_date(:br_temp_date,'YYYYMMDD'),-2)),'YYYYMMDD')
+		INTO	:br_start_date
+		FROM	DUAL;
+
+		//cout <<"down"<<endl;
+	}
+
+	br_start_date[8] = '\0'; 
+
+	//cout << "br_start_date  : " << br_start_date ;
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	to_char((ADD_MONTHS(to_date(:br_start_date,'YYYYMMDD'),1)-1),'YYYYMMDD') //For Month End billing
+	//SELECT	to_char(ADD_MONTHS(to_date(:br_start_date,'YYYYMMDD'),1),'YYYYMMDD')  // For Interim Billing
+	INTO	:br_end_date
+	FROM	DUAL;
+
+	br_end_date[8] = '\0'; 
+
+	//cout << "End date : " << br_end_date ;
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	to_char((to_date(:br_end_date ,'YYYYMMDD')+:br_bill_grace_period),'YYYYMMDD')
+	INTO	:br_due_date
+	FROM	DUAL;
+
+	br_due_date[8] = '\0'; 
+
+	//cout << "Due date : " << br_due_date ;
+
+	// Dates hardcode start - hack
+	/*
+	strcpy(br_start_date,"20011201");
+    br_start_date[8] = '\0'; 
+    strcpy(br_end_date,"20011231");
+    br_end_date[8] = '\0'; 
+    strcpy(br_due_date,"20020115");
+    br_due_date[8] = '\0';
+	*/
+
+	// Dates hardcode end - hack 
+
+	gsm_connections->start_date = br_start_date;
+	gsm_connections->end_date = br_end_date;
+	gsm_connections->due_date = br_due_date;
+
+	gsm_connections->sys_date = br_system_date;
+
+	// Added on 16-09-2002
+	reng_start_date.set_date(br_start_date);
+	reng_end_date.set_date(br_end_date); 
+	reng_sys_date.set_date(br_system_date);
+	// end - 16-09-2002
+	  
+}
+
+
+//-- pro_rate_newcust
+void connections::db_read_pro_rate_newcust()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct pro_rate_newcust_t
+	{
+			int		instance;						// number(1)
+			char	client_code[8];					// varchar2(8)
+			int		account_no;						// number(10)				
+			char	changed_date[BUF_LEN];			// date
+			float	amount;							// number(14,2)
+			char	old_package_code[BUF_LEN];		// varchar2(5)
+			char	new_package_code[BUF_LEN];		// varchar2(5)
+			char	processed[2];					// varchar2(1)
+			float	pkg_prorate_amt;				// number(14,2)
+	} *a;
+
+	struct pro_rate_newcust_ind
+	{ 
+  		short	instance_ind;				
+		short	client_code_ind;		
+		short	account_no_ind;					
+		short	changed_date_ind;				
+		short	amount_ind;		
+		short	old_package_code_ind;
+		short	new_package_code_ind;				
+		short	processed_ind;		
+		short	pkg_prorate_amt_ind;				
+	}a_ind[FETCH_SIZE];
+
+	char t_start_date[20], t_end_date[20];
+	int rows_to_fetch, rows_before, rows_this_time;
+	int t_start_ac, t_end_ac;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+	t_start_ac = start_ac_no;
+	t_end_ac = end_ac_no;
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new pro_rate_newcust_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for pro_rate_newcust fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_pro_rate_newcust CURSOR FOR
+	SELECT	INSTANCE,
+			CLIENT_CODE,
+			ACCOUNT_NO,				
+			CHANGED_DATE,
+			AMOUNT,
+			OLD_PACKAGE_CODE,
+			NEW_PACKAGE_CODE,
+			PROCESSED,
+			PKG_PRORATE_AMT
+	FROM	PRO_RATE_NEWCUST
+	WHERE TRUNC(CHANGED_DATE) >= to_date(:t_start_date,'YYYYMMDD') AND TRUNC(CHANGED_DATE) <= to_date(:t_end_date,'YYYYMMDD')
+	ORDER BY INSTANCE;
+			
+       
+    EXEC SQL AT ISP  OPEN c_pro_rate_newcust; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_pro_rate_newcust INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].changed_date,
+				  ((a_ind[i].changed_date_ind < 0) ? "UNDEF":a[i].changed_date));
+			strcpy(a[i].old_package_code,
+				  ((a_ind[i].old_package_code_ind < 0) ? "UNDEF":a[i].old_package_code));
+			strcpy(a[i].new_package_code,
+				  ((a_ind[i].new_package_code_ind < 0) ? "UNDEF":a[i].new_package_code));
+			strcpy(a[i].processed,
+				  ((a_ind[i].processed_ind < 0) ? "UNDEF":a[i].processed));
+			a[i].instance = (a_ind[i].instance_ind < 0) ? 0 : a[i].instance;
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0 : a[i].account_no;
+			a[i].amount = (a_ind[i].amount_ind < 0) ? 0.0 : a[i].amount;
+			a[i].pkg_prorate_amt = (a_ind[i].pkg_prorate_amt_ind < 0) ? 0.0 : a[i].pkg_prorate_amt;
+			
+			if(set_current(a[i].account_no))
+			{
+				current->charge.pro_rate += a[i].amount;
+			}
+			
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_pro_rate_newcust; 
+	delete a;
+	printf("%d  pro_rate_newcust records read.\n\n",rows_before);
+} 
+
+
+//-- pro_rate_services
+void connections::db_read_pro_rate_services()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct pro_rate_services_t
+	{
+			int		instance;						// number(2)
+			char	client_code[10];				// varchar2(10)
+			int		account_no;						// number(10)				
+			char	date_changed[BUF_LEN];			// date
+			float	amount;							// number(14,2)
+			char	service_code[BUF_LEN];			// varchar2(5)
+			char	processed[2];					// varchar2(1)
+	} *a;
+
+	struct pro_rate_services_ind
+	{ 
+  		short	instance_ind;				
+		short	client_code_ind;		
+		short	account_no_ind;					
+		short	date_changed_ind;				
+		short	amount_ind;		
+		short	service_code_ind;
+		short	processed_ind;		
+	}a_ind[FETCH_SIZE];
+
+	char t_start_date[20], t_end_date[20];
+	int rows_to_fetch, rows_before, rows_this_time;
+	int t_start_ac, t_end_ac;
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+	strcpy(t_end_date, end_date.c_str());
+	t_start_ac = start_ac_no;
+	t_end_ac = end_ac_no;
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new pro_rate_services_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for pro_rate_services fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_pro_rate_services CURSOR FOR
+	SELECT	INSTANCE,
+			CLIENT_CODE,
+			ACCOUNT_NO,				
+			DATE_CHANGED,
+			AMOUNT,
+			SERVICE_CODE,
+			PROCESSED			
+	FROM	PRO_RATE_services
+	WHERE TRUNC(DATE_CHANGED) >= to_date(:t_start_date,'YYYYMMDD') AND TRUNC(DATE_CHANGED) <= to_date(:t_end_date,'YYYYMMDD');
+			 
+       
+    EXEC SQL AT ISP  OPEN c_pro_rate_services; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_pro_rate_services INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].date_changed,
+				  ((a_ind[i].date_changed_ind < 0) ? "UNDEF":a[i].date_changed));
+			strcpy(a[i].service_code,
+				  ((a_ind[i].service_code_ind < 0) ? "UNDEF":a[i].service_code));
+			strcpy(a[i].processed,
+				  ((a_ind[i].processed_ind < 0) ? "UNDEF":a[i].processed));
+			a[i].instance = (a_ind[i].instance_ind < 0) ? 0 : a[i].instance;
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0 : a[i].account_no;
+			a[i].amount = (a_ind[i].amount_ind < 0) ? 0.0 : a[i].amount;
+			
+			
+			if(set_current(a[i].account_no))
+			{
+				current->charge.pro_rate += a[i].amount;
+			}
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_pro_rate_services; 
+	delete a;
+	printf("%d  pro_rate_services records read.\n\n",rows_before);
+} 
+
+//bill_debts
+FILE* fp;
+void connections::db_insert_bill_debts()
+{
+	
+	EXEC SQL BEGIN DECLARE SECTION;
+		char  b_client_code[50];	// varchar2(8)		
+ 		int   b_account_no;			// number(10)		
+		char  b_bill_no[20];		// varcahr2(10)		
+		float b_amount;				// number(14,2)
+		char  b_bill_date[10];		// date				
+		char  b_due_date[10];		// date
+		int	  b_serial_no;			// number(10) 
+		short b_serial_no_ind;		// indicator variable for b_serial_no			
+		//char  ca_bill_date[14];
+	EXEC SQL END DECLARE SECTION;
+
+	/*
+	fp = fopen("./billdate.txt","r");
+	if(!fp)
+	{
+		cout<<"\nERROR OPENING THE ./billdate.txt"<<endl;
+		exit(0);
+	}
+	fgets( ca_bill_date,14,fp);
+	*/
+	
+
+	EXEC SQL 
+	AT ISP 
+	SELECT MAX(SERIAL_NO) INTO :b_serial_no INDICATOR :b_serial_no_ind FROM BILL_DEBTS;
+
+	b_serial_no = (b_serial_no_ind < 0) ? 1 : (b_serial_no+1);
+	
+	//cout <<"b_serial_no : " << b_serial_no << endl; 
+
+	strcpy(b_client_code, (current->connection.client_code).c_str());
+	b_account_no = current->connection.account_no;
+	strncpy(b_bill_no, (current->connection.invoice_no).c_str(),10);
+	b_bill_no[10] = '\0';
+	strcpy(b_due_date, due_date.c_str());
+	strcpy(b_bill_date, end_date.c_str());
+
+	if ( (current->charge.c_f > 0) && (current->charge.brought_forward >= 0) ) b_amount = current->charge.bill_amount;
+	if ( (current->charge.c_f > 0) && (current->charge.brought_forward < 0) ) b_amount = current->charge.c_f;
+	if (current->charge.c_f <= 0)  b_amount = 0;
+	
+
+	fprintf(logfile, "%s",  "\nb_client_code : " , b_client_code );
+	fprintf(logfile, "%s", "\nb_account_no : " , b_account_no );
+	fprintf(logfile, "%s","\nb_bill_no : " , b_bill_no );
+	
+	EXEC SQL 
+	AT ISP 
+	INSERT INTO BILL_DEBTS (SERIAL_NO, CLIENT_CODE, ACCOUNT_NO, BILL_NO, AMOUNT, BILL_DATE,
+	 DUE_DATE) VALUES (:b_serial_no, :b_client_code, :b_account_no, :b_bill_no, :b_amount, to_date(:b_bill_date,'YYYYMMDD'), to_date(:b_due_date,'YYYYMMDD'));
+
+/*	INSERT INTO BILL_DEBTS (SERIAL_NO, CLIENT_CODE, ACCOUNT_NO, BILL_NO, AMOUNT, BILL_DATE,
+	 DUE_DATE) VALUES (:b_serial_no, :b_client_code, :b_account_no, :b_bill_no, :b_amount, to_date(:ca_bill_date,'YYYYMMDD'), to_date(:b_due_date,'YYYYMMDD'));
+*/	
+	//printf("bill_debts inserted ");
+	fprintf(logfile, "%s","\nbill_debts inserted " );
+	//fclose(fp);
+}
+
+
+void connections::db_insert_bill_month_definitions()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	char	b_TEMP_BILL_MONTH[9];			//	VARCHAR2(8)
+	char	b_BILL_RUN_DATE[20];		//	DATE
+	char	b_BR_CODE[30];				//	VARCHAR2(5)
+	char	b_BILL_MONTH[9];
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(b_BILL_RUN_DATE, gsm_connections->sys_date.c_str());
+	strcpy(b_BR_CODE,gsm_bill_cycle->bill_cycle_code.c_str());
+	strcpy(b_TEMP_BILL_MONTH,gsm_connections->start_date.c_str());
+
+	
+	b_TEMP_BILL_MONTH[8] = '\0';
+	
+
+	
+	EXEC SQL
+	AT ISP
+	SELECT TO_CHAR(TO_DATE(:b_TEMP_BILL_MONTH, 'YYYYMMDD'), 'YYYY-MON')
+	INTO	:b_BILL_MONTH	
+	FROM DUAL;
+	
+	b_BILL_MONTH[8] = '\0';
+	//cout << b_BILL_MONTH << "end" << endl;
+
+	EXEC SQL 
+	AT ISP 
+	INSERT INTO BILL_MONTH_DEFINITION (BILL_MONTH,
+		  BILL_RUN_DATE, BR_CODE) VALUES (
+		  :b_BILL_MONTH, to_date(:b_BILL_RUN_DATE,'YYYYMMDD'), :b_BR_CODE);
+	
+	
+	printf("\nbill_month_definitions updated ");
+
+}
+
+
+//-- read isp_services
+void connections::db_read_isp_services()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	float b_default_quota;
+	float b_extra_rental;
+	
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC SQL 
+	AT ISP
+	SELECT DEFAULT_QUOTA, EXTRA_RENTAL 
+	INTO :b_default_quota, :b_extra_rental
+	FROM ISP_SERVICES
+	WHERE	service_code = 'EMAIL';
+
+	EXEC SQL WHENEVER NOT FOUND DO not_found_error("No relevant entry for service EMAIL in ISP_SERVICES");
+
+	default_quota	= b_default_quota;
+	extra_rental	= b_extra_rental;
+	
+	printf("\nisp_services read ");
+}   
+
+//-- truncate bill_summary_items_i
+void connections::truncate_bill_summary_items_i()
+{
+    EXEC SQL 
+	AT ISP 
+	TRUNCATE TABLE BILL_SUMMARY_ITEMS_I DROP STORAGE;				
+
+	printf("bill_summary_items_i truncated");
+}
+
+
+//-- truncate bill_master_i
+void connections::truncate_bill_master_i()
+{
+    EXEC SQL 
+	AT ISP 
+	TRUNCATE TABLE BILL_MASTER_I DROP STORAGE;				
+			
+	printf("bill_master_i truncated");
+}
+
+void connections::db_insert_bill_summary_items_i()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	char	b_BILL_NO[15];			//	NUMBER(10)
+	char	b_ITEM_CODE[20];		//	VARCHAR2(10)
+	float	b_VALUE;				//	NUMBER(12,2)
+	float	b_VALUE_VAT;			//  NUMBER(12,2)
+	EXEC SQL END DECLARE SECTION;
+
+	// initalise account number & invoice number common for all items in bill summary
+
+	strncpy(b_BILL_NO, (current->connection.invoice_no).c_str(),10);
+
+	b_BILL_NO[10] = '\0';
+
+	for(BILL_SUMMARY_DEF::iterator i=summary.begin(); i!=summary.end(); i++)
+	{
+		strcpy(b_ITEM_CODE, (*i).first.c_str());
+		b_VALUE		= (*i).second.amount;
+		b_VALUE_VAT = (*i).second.vat_amount;
+
+		/*
+		cout << "b_BILL_NO :	" << b_BILL_NO << endl;
+		cout << "b_ITEM_CODE :	" << b_ITEM_CODE << endl;
+		cout << "b_VALUE :		" << b_VALUE << endl;
+		cout << "b_VALUE_VAT :	" << b_VALUE_VAT << endl;
+		*/
+
+		EXEC SQL 
+		AT ISP 
+		INSERT INTO BILL_SUMMARY_ITEMS_I (BILL_NO,
+		  ITEM_CODE, AMOUNT, VAT_AMOUNT) VALUES (:b_BILL_NO, :b_ITEM_CODE, :b_VALUE, :b_VALUE_VAT);
+	}
+	
+	//printf("bill_summary_items_i updated ");
+
+}
+
+void connections::db_insert_bill_master_i()
+{
+
+EXEC SQL BEGIN DECLARE SECTION;
+	char  ub_bill_no[50];		// varcahr2(10)		not null,
+	char  ub_client_code[50];	// varchar2(8)		not null,
+ 	int   ub_account_no;		// number(10)		not null,
+	char  ub_start_date[10];	// date 			not null,
+	char  ub_end_date[10];		// date				not null,
+	char  ub_due_date[10];		// date 			not null,
+	float ub_balance_bf;		// number(14,2)		not null,
+	float ub_bill_payments;		// number(14,2)		not null,
+	char  ub_br_code[50];		// varchar2(2)		not null,
+	float ub_total_bill_value;	// number(14,2)		not null,
+	float ub_balance_cf;		// number(14,2)		not null -- for next bill (bf-payments+bill_amount)
+	int	  ub_run_no;			// number(5)
+	char  ub_user_id[20];		// varchar2(30)
+	char  b_sys_date[10];		// sysdate  -  YYYYMMDD	
+EXEC SQL END DECLARE SECTION;
+
+	strcpy(b_sys_date, gsm_connections->sys_date.c_str());
+	int position = strcspn( current->call.user_id.c_str(), " " );
+	if ( position==0 ) 
+	{
+		current->call.user_id = current->call.user_id.substr(0,strcspn( current->call.user_id.c_str(), " " ));
+	}
+	else
+	{
+		current->call.user_id[position] = '\0';
+	}
+	
+	strcpy(ub_user_id, current->call.user_id.c_str());
+
+	strcpy(ub_bill_no, (current->connection.invoice_no).c_str());
+	ub_bill_no[10] = '\0';
+ 	ub_account_no = current->connection.account_no;
+	strcpy(ub_client_code, (current->connection.client_code).c_str());
+
+	
+	ub_client_code[8] = '\0';
+	strcpy(ub_start_date, start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	strcpy(ub_due_date, due_date.c_str());
+	strcpy(ub_br_code,gsm_bill_cycle->bill_cycle_code.c_str());
+	ub_balance_bf = current->charge.brought_forward;
+	ub_run_no = 1;		// Should get from db_pre_bill() - refer following line
+
+	ub_total_bill_value = current->charge.bill_amount;
+	ub_balance_bf = current->charge.brought_forward;
+	ub_balance_cf = current->charge.c_f;
+	ub_bill_payments = current->charge.payments;
+
+	
+	/*
+	cout<<" ub_bill_no="<<ub_bill_no
+		<<" ub_account_no="<<ub_account_no
+		<<" ub_start_date="<<ub_start_date
+		<<" ub_end_date="<<ub_end_date
+		<<" ub_due_date="<<ub_due_date
+		<<" ub_balance_bf="<<ub_balance_bf
+		<<" ub_bill_payments="<<ub_bill_payments
+		<<" ub_br_code="<<ub_br_code
+		<<" ub_total_bill_value="<<ub_total_bill_value
+		<<" ub_balance_cf="<<ub_balance_cf
+		<<" ub_run_number="<<ub_run_no
+		<<" ub_user_id="<<ub_user_id<<endl;
+	*/
+	
+		
+	
+		EXEC SQL 
+		AT ISP 
+		INSERT INTO BILL_MASTER_I
+		(
+			CLIENT_CODE,
+			ACCOUNT_NO,
+			BILL_DATE,
+			PROCESSED_DATE,
+			BILL_PERIOD_START,
+			BILL_PERIOD_END,
+			DUE_DATE,
+			BILL_RUN_CODE,
+			BILL_AMOUNT,
+			BALANCE_BF,
+			BILL_PAYMENTS,
+			BALANCE_CF,
+			RUN_NO,
+			USER_ID,
+			BILL_NO 
+		)
+			VALUES
+		(
+			:ub_client_code,
+			:ub_account_no,
+			to_date(:ub_end_date,'YYYYMMDD'),
+			to_date(:b_sys_date,'YYYYMMDD'),
+			to_date(:ub_start_date,'YYYYMMDD'), 
+			to_date(:ub_end_date,'YYYYMMDD'), 
+			to_date(:ub_due_date,'YYYYMMDD'),
+			:ub_br_code, 
+			:ub_total_bill_value,
+			:ub_balance_bf,
+			:ub_bill_payments,
+			:ub_balance_cf,
+			:ub_run_no,
+			:ub_user_id,
+			:ub_bill_no 	 
+		); 
+
+	//printf("bill master updated -------------");
+	fprintf(logfile, "%s",  "\nbill_master_i inserted");
+}
+
+//-- connections - interim bill
+void connections::db_read_connections_for_interim_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection_t
+	{
+		int		account_no;
+		char	package_code[6];		// 6 instead of BUF_LEN // varchar2(5)
+		char	current_status_date[BUF_LEN];
+		char	tax_group_id[10];
+		char	corporate_code[10];
+		char	client_code[10];		// varchar2(8)
+		char	vat_no[BUF_LEN];		//	varchar2(20)
+		char	connection_status[BUF_LEN];
+	} *a;
+
+	struct connection_ind
+	{ 
+  		short	account_no_ind;
+		short	package_code_ind;
+		short	current_status_date_ind;
+		short	tax_group_id_ind;
+		short	corporate_code_ind;
+		short	client_code_ind;
+		short	vat_no_ind;
+		short	connection_status_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char ub_start_date[15];
+	char ub_end_date[15];
+
+EXEC SQL END DECLARE SECTION;
+
+EXEC ORACLE OPTION (char_map=string) ;
+
+	int i;
+	strcpy(ub_start_date, start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	debug("ub_end_date :");
+	debug(ub_end_date);
+	cout << endl;
+	connection_detail cd;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new connection_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connection fetch"<<endl;
+		exit(0);
+	}
+	    
+	EXEC SQL 
+	AT ISP 
+	DECLARE  c_connection_i CURSOR FOR 
+	SELECT	ACCOUNT_NO,				
+			PACKAGE_CODE,		
+			CURRENT_STATUS_DATE,					
+			TAX_GROUP_ID,				
+			CORPORATE_CODE,
+			CLIENT_CODE,
+			VAT_NO,
+			CONNECTION_STATUS
+	FROM	CONNECTIONS
+	WHERE	TRUNC(COMMENCEMENT_DATE) <= to_date(:ub_end_date,'YYYYMMDD')
+	AND 
+	(	
+		CONNECTION_STATUS ='CONNT' OR CONNECTION_STATUS ='TDISC' OR 
+		(
+			(
+				TRUNC(CURRENT_STATUS_DATE) BETWEEN 
+				to_date(:ub_start_date,'YYYYMMDD') 
+				AND 
+				to_date(:ub_end_date,'YYYYMMDD')
+			)
+			AND
+			( CONNECTION_STATUS ='PDISC' )
+		)
+	); 
+           
+    EXEC SQL AT ISP  OPEN c_connection_i; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_connection_i INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0 : a[i].account_no ;
+			strcpy(a[i].package_code,
+				  ((a_ind[i].package_code_ind < 0) ? "UNDEF":a[i].package_code));
+			strcpy(a[i].corporate_code,
+				  ((a_ind[i].corporate_code_ind < 0) ? "UNDEF":a[i].corporate_code));
+			strcpy(a[i].current_status_date,
+				  ((a_ind[i].current_status_date_ind < 0) ? "20501225":a[i].current_status_date)); // 20501225 a far away date put for null entries
+			strcpy(a[i].tax_group_id,
+				  ((a_ind[i].tax_group_id_ind < 0) ? "UNDEF":a[i].tax_group_id));
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].vat_no,
+				  ((a_ind[i].vat_no_ind < 0) ? "UNDEF":a[i].vat_no));
+			strcpy(a[i].connection_status,
+				  ((a_ind[i].connection_status_ind < 0) ? "UNDEF":a[i].connection_status));
+
+
+			int posi = strcspn( a[i].client_code, " " );
+			a[i].client_code[posi] = '\0';
+
+			
+
+			//assining values fetched from db to the connection_detail class
+			cd.account_no		= a[i].account_no;					
+			cd.package_code		= a[i].package_code;
+
+			// cahnged on 16-09-2002
+			a[i].current_status_date[8] = '\0';
+			cd.current_status_date.set_date(a[i].current_status_date);	
+			//cd.disconnected_date= a[i].disconnected_date;	
+			// end - 16-09-2002
+								
+			cd.tax_group_id			= a[i].tax_group_id;						
+			cd.corporate_code		= a[i].corporate_code;
+			cd.client_code			= a[i].client_code;	
+			cd.vat_no				= a[i].vat_no;	
+			cd.connection_status	= a[i].connection_status;	
+			
+
+			CLIENTS_DEF::iterator i_current = gsm_connections->clients_map.find(a[i].client_code);
+			
+			if(i_current != gsm_connections->clients_map.end())
+			{
+				//cout <<"Client code matches >>>>>>>>>>>>>>>" << endl;
+
+				if ( strcmp(gsm_bill_cycle->bill_cycle_code.c_str(), (*i_current).second.c_str())==0 )
+				{
+					//cout <<"Bill run code matches >>>>>>>>>>>>>>>" << endl;
+					insert(a[i].account_no, cd);
+					//print_detail();
+				}
+				else
+				{
+					//cout <<"Bill run code do not match >>>>>>>>>>>>>>>" << endl;
+				}
+			}
+			else
+			{
+				//cout <<"Client code does not match >>>>>>>>>>>>>>>" << endl;
+			}
+		}
+	} 
+
+
+	EXEC SQL AT ISP CLOSE c_connection_i; 
+	delete a;
+	printf("%d  connection records read.\n\n",rows_before);
+} 
+
+//-- bill_master for interim bill
+void connections::db_read_bill_master_for_interim_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct bill_master_t
+	{
+			char	client_code[BUF_LEN];				
+			int		account_no;		
+			char	bill_no[BUF_LEN];					
+			char	due_date[BUF_LEN];				
+			char	bill_date[BUF_LEN];		
+			char	bill_period_start[BUF_LEN];				
+			char	bill_period_end[BUF_LEN];	
+			float	balance_bf;		
+			float	bill_amount;		
+			float	balance_cf;		
+			char	bill_run_code[BUF_LEN];
+			float	bill_payments;
+			int		run_no;
+			char	printed[BUF_LEN];
+	} *a;
+
+	struct bill_master_ind
+	{ 
+  		short	client_code_ind;
+		short	account_no_ind;
+		short	bill_no_ind;
+		short	due_date_ind;
+		short	bill_date_ind;
+		short	bill_period_start_ind;
+		short	bill_period_end_ind;
+		short	balance_bf_ind;
+		short	bill_amount_ind;
+		short	balance_cf_ind;
+		short	bill_run_code_ind;
+		short	bill_payments_ind;
+		short	run_no_ind;
+		short	printed_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+	char  ub_start_date[10];		// date 			not null
+	char  ub_end_date[10];			// date				not null
+	
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(ub_start_date, start_date.c_str());
+	strcpy(ub_end_date, end_date.c_str());
+	bill_master bm;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new bill_master_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for bill_master fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_bill_master_i CURSOR FOR 
+	SELECT	CLIENT_CODE,				
+			ACCOUNT_NO,		
+			BILL_NO,					
+			DUE_DATE,				
+			BILL_DATE,		
+			BILL_PERIOD_START,				
+			BILL_PERIOD_END,	
+			BALANCE_BF,		
+			BILL_AMOUNT,		
+			BALANCE_CF,		
+			BILL_RUN_CODE,
+			BILL_PAYMENTS,
+			RUN_NO,
+			PRINTED
+	FROM	BILL_MASTER
+	WHERE	BILL_DATE IS NULL
+	AND		BILL_PERIOD_START = to_date(:ub_start_date,'YYYYMMDD'); 
+       
+    EXEC SQL AT ISP  OPEN c_bill_master_i; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_bill_master_i INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no ;
+			strcpy(a[i].bill_no,
+				  ((a_ind[i].bill_no_ind < 0) ? "UNDEF":a[i].bill_no));
+			strcpy(a[i].due_date,
+				  ((a_ind[i].due_date_ind < 0) ? "UNDEF":a[i].due_date));
+			strcpy(a[i].bill_date,
+				  ((a_ind[i].bill_date_ind < 0) ? "UNDEF":a[i].bill_date));
+			strcpy(a[i].bill_period_start,
+				  ((a_ind[i].bill_period_start_ind < 0) ? "UNDEF":a[i].bill_period_start));
+			strcpy(a[i].bill_period_end,
+				  ((a_ind[i].bill_period_end_ind < 0) ? "UNDEF":a[i].bill_period_end));
+			a[i].balance_bf = (a_ind[i].balance_bf_ind < 0) ? 0.0 : a[i].balance_bf;
+			a[i].bill_amount = (a_ind[i].bill_amount_ind < 0) ? 0.0 : a[i].bill_amount;
+			a[i].balance_cf = (a_ind[i].balance_cf_ind < 0) ? 0.0 : a[i].balance_cf ;
+			strcpy(a[i].bill_run_code,
+				  ((a_ind[i].bill_run_code_ind < 0) ? "UNDEF":a[i].bill_run_code));
+			a[i].bill_payments = (a_ind[i].bill_payments_ind < 0) ? 0.0 : a[i].bill_payments;
+			a[i].run_no = (a_ind[i].run_no_ind < 0) ? 0.0 : a[i].run_no;
+			strcpy(a[i].printed,
+				  ((a_ind[i].printed_ind < 0) ? "UNDEF":a[i].printed));
+			
+
+			
+			if(set_current(a[i].account_no))
+			{
+				current->charge.payments += a[i].bill_payments; // payments during period
+				current->charge.brought_forward = a[i].balance_bf;	
+				current->connection.invoice_no = a[i].bill_no;
+				current->charge.open_bill_found = 1;
+			}
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_bill_master_i; 
+	delete a;
+	printf("%d  bill_master records read.\n\n",rows_before);
+} 
+
+//-- clients - interim bill
+void connections::db_read_clients_for_interim_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct client_t
+	{
+		char	br_code[10];			// varchar2(5)
+		char	client_code[10];		// varchar2(8)
+	} *a;
+
+	struct client_ind
+	{ 
+  		short	br_code_ind;
+		short	client_code_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char	t_start_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date, start_date.c_str());
+	
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new client_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for client fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_client_i CURSOR FOR
+	SELECT	BR_CODE,
+			CLIENT_CODE		
+	FROM	CLIENTS;
+       
+    EXEC SQL AT ISP  OPEN c_client_i; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_client_i INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+			
+			strcpy(a[i].br_code,
+				  ((a_ind[i].br_code_ind < 0) ? "UNDEF":a[i].br_code));
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+
+			int posi = strcspn( a[i].client_code, " " );
+			a[i].client_code[posi] = '\0';
+
+			int position = strcspn( a[i].br_code, " " );
+			a[i].br_code[position] = '\0';
+
+			
+
+			clients_map[a[i].client_code] = a[i].br_code;
+			
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_client_i; 
+	delete a;
+	printf("%d  clients records read.\n\n",rows_before);
+} 
+
+
+//-- rental_advance_payments - interim bill
+void connections::db_read_rental_advance_payments_for_interim_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct rental_advance_payments_t
+	{
+			char	client_code[8];		// varchar2(8)			
+			char	date_paid[BUF_LEN];			// date
+			int		no_of_months_free;					
+			int		no_of_months_paid;				
+			int		account_no;		
+			int		balance_months;				
+	} *a;
+
+	struct rental_advance_payments_ind
+	{ 
+  		short	client_code_ind;				
+		short	date_paid_ind;		
+		short	no_of_months_free_ind;					
+		short	no_of_months_paid_ind;				
+		short	account_no_ind;		
+		short	balance_months_ind;				
+	}a_ind[FETCH_SIZE];
+
+	char t_start_date[20];
+	int rows_to_fetch, rows_before, rows_this_time;
+	char ub_end_date[15];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	strcpy(t_start_date,start_date.c_str());
+
+	strcpy(ub_end_date, end_date.c_str());
+	advance_payment	ap;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new rental_advance_payments_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for rental_advance_payments fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_rental_advance_payments_i CURSOR FOR
+	SELECT	CLIENT_CODE,				
+			DATE_PAID,
+			NO_OF_MONTHS_FREE,		
+			NO_OF_MONTHS_PAID,					
+			ACCOUNT_NO,				
+			BALANCE_MONTHS		
+	FROM	RENTAL_ADVANCE_PAYMENTS
+	WHERE	TRUNC(DATE_PAID) <= to_date(:ub_end_date,'YYYYMMDD')
+	ORDER BY DATE_PAID DESC; 
+       
+    EXEC SQL AT ISP  OPEN c_rental_advance_payments_i; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_rental_advance_payments_i INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].date_paid,
+				  ((a_ind[i].date_paid_ind < 0) ? "UNDEF":a[i].date_paid));
+			a[i].no_of_months_free = (a_ind[i].no_of_months_free_ind < 0) ? 0.0 : a[i].no_of_months_free;
+			a[i].no_of_months_paid = (a_ind[i].no_of_months_paid_ind < 0) ? 0.0 : a[i].no_of_months_paid;
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no;
+			a[i].balance_months = (a_ind[i].balance_months_ind < 0) ? 0.0 : a[i].balance_months;
+			
+
+			if (a[i].balance_months > 0)
+			{
+				ap.account_no		= a[i].account_no;
+				ap.client_code		= a[i].client_code;						
+				ap.date_paid		= a[i].date_paid;						
+				ap.balance_months	= a[i].balance_months;
+				
+				gsm_connections->rental_advance_payments_map[a[i].account_no] = ap;
+			}
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_rental_advance_payments_i; 
+	delete a;
+	printf("%d  rental_advance_payments records read.\n\n",rows_before);
+} 
+
+
+//-- packages - interim bill
+void package_map::db_read_packages_for_interim_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct packages_t
+	{
+			char	package_code[6];		// 6 instead of BUF_LEN				
+			char	description[BUF_LEN];		
+			float	rental;					
+			char	free_applied_on[BUF_LEN];				
+			int		free_in_bytes;		
+			int		free_out_bytes;				
+			int		free_minutes;	
+			char	activated_on[BUF_LEN];		
+			char	deactivated_on[BUF_LEN];
+			char	package_type[BUF_LEN];
+			int		free_units;				// number(10)		
+	} *a;
+
+	struct packages_ind
+	{ 
+  		short	package_code_ind;				
+		short	description_ind;		
+		short	rental_ind;					
+		short	free_applied_on_ind;				
+		short	free_in_bytes_ind;		
+		short	free_out_bytes_ind;				
+		short	free_minutes_ind;	
+		short	activated_on_ind;		
+		short	deactivated_on_ind;
+		short	package_type_ind;
+		short	free_units_ind;	
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+
+	char	t_start_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	strcpy(t_start_date,gsm_connections->start_date.c_str());
+	
+	int i;
+	packages p;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new packages_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for packages fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_packages_i CURSOR FOR
+	SELECT	PACKAGE_CODE,				
+			DESCRIPTION,
+			RENTAL,		
+			FREE_APPLIED_ON,					
+			FREE_IN_BYTES,				
+			FREE_OUT_BYTES,		
+			FREE_MINUTES,				
+			ACTIVATED_ON,	
+			DEACTIVATED_ON,
+			PACKAGE_TYPE,
+			FREE_UNITS			
+	FROM	PACKAGES
+	WHERE PACKAGE_TYPE = 'O';
+	       
+    EXEC SQL AT ISP  OPEN c_packages_i; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_packages_i INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			strcpy(a[i].package_code,
+				  ((a_ind[i].package_code_ind < 0) ? "UNDEF":a[i].package_code));
+			strcpy(a[i].description,
+				  ((a_ind[i].description_ind < 0) ? "UNDEF":a[i].description));
+			a[i].rental = (a_ind[i].rental_ind < 0) ? 0.0 : a[i].rental ;
+			strcpy(a[i].free_applied_on,
+				  ((a_ind[i].free_applied_on_ind < 0) ? "UNDEF":a[i].free_applied_on));
+			a[i].free_in_bytes = (a_ind[i].free_in_bytes_ind < 0) ? 0.0 : a[i].free_in_bytes ;
+			a[i].free_out_bytes = (a_ind[i].free_out_bytes_ind < 0) ? 0.0 : a[i].free_out_bytes ;
+			a[i].free_minutes = (a_ind[i].free_minutes_ind < 0) ? 0.0 : a[i].free_minutes ;
+			strcpy(a[i].activated_on,
+				  ((a_ind[i].activated_on_ind < 0) ? "UNDEF":a[i].activated_on));
+			strcpy(a[i].deactivated_on,
+				  ((a_ind[i].deactivated_on_ind < 0) ? "UNDEF":a[i].deactivated_on));
+			strcpy(a[i].package_type,
+				  ((a_ind[i].package_type_ind < 0) ? "UNDEF":a[i].package_type));
+			a[i].free_units = (a_ind[i].free_units_ind < 0) ? 0.0 : a[i].free_units ;
+			
+			//assining values fetched from db to the packages class
+			p.package_code			= a[i].package_code;				
+			p.description			= a[i].description;		
+			p.rental				= a[i].rental;					
+			p.free_applied_on		= a[i].free_applied_on;				
+			p.free_in_bytes			= a[i].free_in_bytes;		
+			p.free_out_bytes		= a[i].free_out_bytes;				
+			p.free_minutes			= a[i].free_minutes;	
+			p.activated_on			= a[i].activated_on;		
+			p.deactivated_on		= a[i].deactivated_on;
+			p.package_type			= a[i].package_type;
+			p.free_units			= a[i].free_units;	
+			
+			gsm_packages->all_packages[p.package_code] = p;
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_packages_i; 
+	delete a;
+	printf("%d  packages records read.\n\n",rows_before);
+} 
+
+//-- connection_services - interim bill
+void connection_services_multimap::db_read_connection_services_for_interim_bill()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	struct connection_services_t
+	{
+			float	rental;				
+			char	start_date[BUF_LEN];		
+			char	end_date[BUF_LEN];					
+			int		account_no;				
+			char	client_code[BUF_LEN];		
+			char	service_code[BUF_LEN];				
+			char	user_username[BUF_LEN];		
+			int		service_instance;		
+			char	connection_status[BUF_LEN];		
+			char	attribution[BUF_LEN];
+			char	rate_group_id[BUF_LEN];
+			char	rental_actv_date[BUF_LEN];
+			float	service_quota;
+	} *a;
+
+	struct connection_services_ind
+	{ 
+  		short	rental_ind;
+		short	start_date_ind;
+		short	end_date_ind;
+		short	account_no_ind;
+		short	client_code_ind;
+		short	service_code_ind;
+		short	user_username_ind;
+		short	service_instance_ind;
+		short	connection_status_ind;
+		short	attribution_ind;
+		short	rate_group_id_ind;
+		short	rental_actv_date_ind;
+		short	service_quota_ind;
+	}a_ind[FETCH_SIZE];
+
+	int rows_to_fetch, rows_before, rows_this_time;
+	char t_start_date[20];
+	char t_end_date[20];
+
+EXEC SQL END DECLARE SECTION;
+
+	int i;
+	connection_services cs;
+
+	strcpy(t_start_date,gsm_connections->start_date.c_str());
+	strcpy(t_end_date, gsm_connections->end_date.c_str());
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				   // previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE; 
+
+	if((a = new connection_services_t[rows_to_fetch])==NULL)
+	{
+		cout<<" cant allocate memeory for connection_services fetch"<<endl;
+		exit(0);
+	}
+
+ 
+    EXEC SQL 
+	AT ISP 
+	DECLARE  c_connection_services_i CURSOR FOR 
+	SELECT	RENTAL,				
+			START_DATE,		
+			END_DATE,					
+			ACCOUNT_NO,				
+			CLIENT_CODE,		
+			SERVICE_CODE,				
+			USER_USERNAME,		
+			SERVICE_INSTANCE,		
+			CONNECTION_STATUS,		
+			ATTRIBUTION,
+			RATE_GROUP_ID,
+			RENTAL_ACTV_DATE,
+			SERVICE_QUOTA
+	FROM	CONNECTION_SERVICES;
+       
+    EXEC SQL AT ISP  OPEN c_connection_services_i; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE; 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL AT ISP FOR :rows_to_fetch FETCH c_connection_services_i INTO :a INDICATOR :a_ind; 		 
+
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d \n", rows_this_time, rows_before);
+
+		for(i=0; i<rows_this_time; i++)
+		{
+			//handling null fetches
+
+			a[i].rental = (a_ind[i].rental_ind < 0) ? 0.0 : a[i].rental ;
+			strcpy(a[i].start_date,
+				  ((a_ind[i].start_date_ind < 0) ? "UNDEF":a[i].start_date));
+			strcpy(a[i].end_date,
+				  ((a_ind[i].end_date_ind < 0) ? "UNDEF":a[i].end_date));
+			a[i].account_no = (a_ind[i].account_no_ind < 0) ? 0.0 : a[i].account_no ;
+			strcpy(a[i].client_code,
+				  ((a_ind[i].client_code_ind < 0) ? "UNDEF":a[i].client_code));
+			strcpy(a[i].service_code,
+				  ((a_ind[i].service_code_ind < 0) ? "UNDEF":a[i].service_code));
+			strcpy(a[i].user_username,
+				  ((a_ind[i].user_username_ind < 0) ? "UNDEF":a[i].user_username));
+			a[i].service_instance = (a_ind[i].service_instance_ind < 0) ? 0.0 : a[i].service_instance ;
+			strcpy(a[i].connection_status,
+				  ((a_ind[i].connection_status_ind < 0) ? "UNDEF":a[i].connection_status));
+			strcpy(a[i].attribution,
+				  ((a_ind[i].attribution_ind < 0) ? "UNDEF":a[i].attribution));
+			strcpy(a[i].rate_group_id,
+				  ((a_ind[i].rate_group_id_ind < 0) ? "UNDEF":a[i].rate_group_id));
+			strcpy(a[i].rental_actv_date,
+				  ((a_ind[i].rental_actv_date_ind < 0) ? "UNDEF":a[i].rental_actv_date));
+				a[i].service_quota = (a_ind[i].service_quota_ind < 0) ? 0.0 : a[i].service_quota ;
+
+			
+			//assining values fetched from db to the connection_detail class
+			cs.rental			= a[i].rental;				
+			cs.start_date		= a[i].start_date;		
+			cs.end_date			= a[i].end_date;					
+			cs.account_no		= a[i].account_no;				
+			cs.client_code		= a[i].client_code;		
+			cs.service_code		= a[i].service_code;				
+			cs.user_username	= a[i].user_username;		
+			cs.service_instance	= a[i].service_instance;		
+			cs.connection_status= a[i].connection_status;		
+			cs.attribution		= a[i].attribution;
+			cs.rate_group_id	= a[i].rate_group_id;
+			cs.rental_actv_date	= a[i].rental_actv_date;
+			cs.service_quota	= a[i].service_quota;
+
+			gsm_connection_services->insert(cs.account_no, cs);
+
+		}
+	} 
+
+	EXEC SQL AT ISP CLOSE c_connection_services_i; 
+	delete a;
+	printf("%d  connection_services records read.\n\n",rows_before);
+}  
+
+// billrun_definitions - ibill
+
+void connections::db_read_billrun_definitions_for_interim_bill()
+{
+
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	 char	br_br_code[10];			//	VARCHAR2(5)		
+	 int	br_start_day;				//	NUMBER(2)
+	 int	br_bill_grace_period;		//	NUMBER(3)
+	 char	br_system_date[20];
+	 char	br_temp_date[20];
+	 char	br_start_date[20];
+	 char	br_end_date[20];
+	 char	br_due_date[20];
+	 char	bill_cycle_code[6];			
+			 
+	EXEC SQL END DECLARE SECTION;
+
+	strcpy(bill_cycle_code, gsm_bill_cycle->bill_cycle_code.c_str());
+
+	EXEC SQL WHENEVER NOT FOUND DO not_found_error("No relevant entry in billrun_definitions"); 
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	BR_CODE, START_DAY, BILL_GRACE_PERIOD 
+	INTO	:br_br_code, 
+			:br_start_day, 
+			:br_bill_grace_period
+	FROM	BILLRUN_DEFINITIONS
+	WHERE BR_CODE = :bill_cycle_code
+	AND ACTIVE = 'Y';
+
+	br_br_code[strcspn( br_br_code, " " )] = '\0';
+
+	br_code = br_br_code;
+	start_day = br_start_day;
+	bill_grace_period = br_bill_grace_period;
+
+	cout << "billrun_definitions  read." << endl;
+	cout << "br_code : " << br_code ;
+	//cout << "start_day : " << start_day << endl;
+	//cout << "bill_grace_period : " << bill_grace_period << endl;
+	
+     
+	EXEC SQL 
+	AT ISP 
+	SELECT	to_char(sysdate,'YYYYMMDD')
+	INTO	:br_system_date
+	FROM	DUAL;
+
+	//cout << "Sysdate : " << br_system_date << endl;
+
+	char sysday[2];
+
+	sysday[0]	= br_system_date[6];
+	sysday[1]	= br_system_date[7];
+	sysday[2]	= '\0';
+
+	//cout << "sysday :" << sysday <<"END" << endl;
+
+	int IntSysday = atoi(sysday);
+
+	//cout << "IntSysday :" << IntSysday <<"END" << endl;
+
+
+	char buf[30];
+	char day[2];
+	
+	strncpy(buf, br_system_date, 6);
+	
+	if (start_day >9)
+	{
+		myitoa(start_day, day);
+		strncpy( buf + 6, day, 2 );
+	}
+	else
+	{
+		char pad[1];
+		pad[0] = '0';
+		strncpy( buf + 6, pad, 1 );
+		myitoa(start_day, day);
+		strncpy( buf + 7, day, 1 );
+	}
+
+	buf[8] = '\0'; 
+	
+	//cout << "buf : " << buf;
+
+	strcpy(br_temp_date, buf);
+
+	br_temp_date[8] = '\0'; 
+
+	//cout << "br_temp_date  : " << br_temp_date ;
+
+	if (IntSysday >= br_start_day)
+	{
+		EXEC SQL 
+		AT ISP 
+		SELECT	to_char((ADD_MONTHS(to_date(:br_temp_date,'YYYYMMDD'),-1)),'YYYYMMDD')
+		INTO	:br_start_date
+		FROM	DUAL;
+
+		//cout <<"up"<<endl;
+	}
+	else
+	{
+		EXEC SQL 
+		AT ISP 
+		SELECT	to_char((ADD_MONTHS(to_date(:br_temp_date,'YYYYMMDD'),-2)),'YYYYMMDD')
+		INTO	:br_start_date
+		FROM	DUAL;
+
+		//cout <<"down"<<endl;
+	}
+
+	br_start_date[8] = '\0'; 
+
+	//cout << "br_start_date  : " << br_start_date ;
+
+	EXEC SQL 
+	AT ISP 
+	//SELECT	to_char((ADD_MONTHS(to_date(:br_start_date,'YYYYMMDD'),1)-1),'YYYYMMDD') //For Month End billing
+	SELECT	to_char(ADD_MONTHS(to_date(:br_start_date,'YYYYMMDD'),1),'YYYYMMDD')  // For Interim Billing
+	INTO	:br_end_date
+	FROM	DUAL;
+
+	br_end_date[8] = '\0'; 
+
+	//cout << "End date : " << br_end_date ;
+
+	EXEC SQL 
+	AT ISP 
+	SELECT	to_char((to_date(:br_end_date ,'YYYYMMDD')+:br_bill_grace_period),'YYYYMMDD')
+	INTO	:br_due_date
+	FROM	DUAL;
+
+	br_due_date[8] = '\0'; 
+
+	//cout << "Due date : " << br_due_date ;
+
+	// Dates hardcode start - hack
+	/*
+	strcpy(br_start_date,"20011201");
+    br_start_date[8] = '\0'; 
+    strcpy(br_end_date,"20011231");
+    br_end_date[8] = '\0'; 
+    strcpy(br_due_date,"20020115");
+    br_due_date[8] = '\0';
+	*/
+
+	// Dates hardcode end - hack 
+
+	//For Interim Bill
+	gsm_connections->start_date = br_end_date;
+	gsm_connections->end_date = br_system_date;
+	
+	gsm_connections->due_date = br_due_date;
+	gsm_connections->sys_date = br_system_date;
+
+	// Added on 16-09-2002
+	reng_start_date.set_date(br_start_date);
+	reng_end_date.set_date(br_end_date); 
+	reng_sys_date.set_date(br_system_date);
+	// end - 16-09-2002
+	  
+}
